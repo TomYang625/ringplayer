@@ -31,10 +31,10 @@
   #panel small{color:var(--sub)}
   #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
   #dial{position:relative;width:min(80vw,70vh,360px);aspect-ratio:1/1;touch-action:none;user-select:none;-webkit-user-select:none}
-  #discBase,#disc{position:absolute;border-radius:50%}
-  #discBase{background:var(--track)}
-  #disc{background:conic-gradient(from -90deg, var(--accent) 0deg 0deg, transparent 0deg)}
-  #hole{position:absolute;border-radius:50%;background:var(--bg)}
+  #discBase,#disc{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border-radius:50%}
+  #discBase{background:var(--track);width:86%;height:86%}
+  #disc{width:86%;height:86%;background:conic-gradient(from -90deg, var(--accent) 0deg 0deg, transparent 0deg)}
+  #hole{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border-radius:50%;background:var(--bg);width:58%;height:58%}
   #knobWrap{position:absolute;left:50%;top:50%;width:0;height:0;transform-origin:0 0;transform:rotate(0deg);pointer-events:none}
   #knob{position:absolute;left:-6px;top:0;width:12px;height:12px;border-radius:50%;background:var(--accent)}
   #centerBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34%;aspect-ratio:1/1;border-radius:50%;border:0;background:var(--surface2);color:var(--txt);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}
@@ -175,12 +175,10 @@ function layout() {
   geo.inner = side * 0.32;
   geo.mid = (geo.outer + geo.inner) / 2;
   const D = (x) => (x * 2).toFixed(1) + 'px';
+  // 圆心位置由 CSS(left:50%; translate(-50%))统一处理，这里只按像素覆盖直径
   discBase.style.width = D(geo.outer); discBase.style.height = D(geo.outer);
-  discBase.style.left = (geo.cx - geo.outer) + 'px'; discBase.style.top = (geo.cy - geo.outer) + 'px';
   disc.style.width = D(geo.outer); disc.style.height = D(geo.outer);
-  disc.style.left = (geo.cx - geo.outer) + 'px'; disc.style.top = (geo.cy - geo.outer) + 'px';
   hole.style.width = D(geo.inner); hole.style.height = D(geo.inner);
-  hole.style.left = (geo.cx - geo.inner) + 'px'; hole.style.top = (geo.cy - geo.inner) + 'px';
   knobWrap.style.left = geo.cx + 'px'; knobWrap.style.top = geo.cy + 'px';
   A('knob').style.top = -(geo.mid + 6) + 'px';
 }
@@ -383,9 +381,15 @@ sensEl.addEventListener('input', () => {
 
 /* ============ 启动 ============ */
 syncSensUI();
-layout();
 startLoop();
 loadStored();
+layout();
+// 监听圆环尺寸变化：防止首帧测量为 0 导致环不显示；尺寸一确定就重排重画
+if ('ResizeObserver' in window) {
+  new ResizeObserver(function () { layout(); paint(); }).observe(dial);
+} else {
+  window.addEventListener('resize', function () { layout(); paint(); });
+}
 
 if ('serviceWorker' in navigator &&
     (location.protocol === 'https:' || location.hostname === 'localhost')) {

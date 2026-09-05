@@ -1,5 +1,5 @@
-/* 简易 Service Worker：缓存应用外壳，支持离线打开（需 https 托管才生效） */
-const CACHE = 'ringplayer-v1';
+/* Service Worker：页面(navigation)走“网络优先”，静态外壳缓存兜底离线；升级版本号即触发旧缓存清理 */
+const CACHE = 'ringplayer-v2';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', (e) => {
@@ -17,6 +17,17 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
+  if (req.mode === 'navigate') {
+    // 页面本身始终取最新（网络优先），失败时才用缓存兜底
+    e.respondWith(
+      fetch(req).then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put('./index.html', copy));
+        return res;
+      }).catch(() => caches.match('./index.html'))
+    );
+    return;
+  }
   e.respondWith(
     caches.match(req).then((hit) => {
       if (hit) return hit;
