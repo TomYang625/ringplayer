@@ -23,6 +23,7 @@
   #title{font-size:18px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #subtitle{font-size:12px;color:var(--sub);margin-top:2px}
   #errorMsg{font-size:12px;color:var(--err);margin-top:4px;display:none}
+  #jsok{display:none;color:#7bd88f;font-size:11px;margin-top:4px}
   .btn{flex:none;border:0;border-radius:20px;background:var(--chip);color:var(--txt);font-size:13px;height:34px;padding:0 12px;cursor:pointer}
   .btn:active{opacity:.7}
   #panel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
@@ -62,6 +63,7 @@
       <div id="title">环形播放器</div>
       <div id="subtitle">点右上角「打开」选择 mp3</div>
       <div id="errorMsg"></div>
+      <div id="jsok">JS 运行中</div>
     </div>
     <button class="btn" id="btnSens">灵敏度</button>
     <button class="btn" id="btnOpen">打开</button>
@@ -337,24 +339,9 @@ function angleOf(px, py) {
 let dragState = { active: false, base: 0, acc: 0, last: null };
 function dist(p) { return Math.hypot(p.clientX - geo.cx, p.clientY - geo.cy); }
 
-dial.addEventListener('pointerdown', (e) => {
-  if (e.button !== undefined && e.button !== 0) return;
-  const d = dist(e);
-  if (d <= geo.inner + 2 || d > geo.outer + 8) return; // 中央交给按钮；环带内才开始
-  if (!duration || cur < 0) { setErr('请先选择并播放一首歌再转动'); return; }
-  e.preventDefault();
-  dragState.active = true;
-  dragState.base = audio.currentTime * 1000;
-  dragState.acc = 0;
-  dragState.last = angleOf(e.clientX, e.clientY);
-  dragging = true;
-  dragTarget = dragState.base;
-  dial.setPointerCapture && dial.setPointerCapture(e.pointerId);
-});
-dial.addEventListener('pointermove', (e) => {
+function scrubMove(clientX, clientY) {
   if (!dragState.active) return;
-  e.preventDefault();
-  const a = angleOf(e.clientX, e.clientY);
+  const a = angleOf(clientX, clientY);
   let delta = a - dragState.last;
   if (delta > Math.PI) delta -= TWO_PI; else if (delta < -Math.PI) delta += TWO_PI;
   dragState.last = a;
@@ -368,7 +355,7 @@ dial.addEventListener('pointermove', (e) => {
     const tip = A('scrubTip');
     if (tip) { tip.textContent = fmt(target); tip.style.display = 'block'; }
   }
-});
+}
 function endDrag() {
   if (dragState.active) {
     dragState.active = false; dragging = false;
@@ -377,8 +364,29 @@ function endDrag() {
   const tip = A('scrubTip');
   if (tip) tip.style.display = 'none';
 }
-dial.addEventListener('pointerup', endDrag);
-dial.addEventListener('pointercancel', endDrag);
+dial.addEventListener('pointerdown', (e) => {
+  if (e.button !== undefined && e.button !== 0) return;
+  const d = dist(e);
+  if (d <= geo.inner + 2) return; // 中央按钮交给 click；环带内任意处可开始
+  if (!duration || cur < 0) { setErr('请先选一首歌并播放，再按住圆环转动'); return; }
+  e.preventDefault();
+  dragState.active = true;
+  dragState.base = audio.currentTime * 1000;
+  dragState.acc = 0;
+  dragState.last = angleOf(e.clientX, e.clientY);
+  dragging = true;
+  dragTarget = dragState.base;
+  try { if (dial.setPointerCapture) dial.setPointerCapture(e.pointerId); } catch (err) {}
+  paint();
+});
+// 移动/抬起在 window 上监听，不依赖指针捕获，Safari 更稳
+window.addEventListener('pointermove', (e) => {
+  if (dragState.active) { e.preventDefault(); scrubMove(e.clientX, e.clientY); }
+}, { passive: false });
+window.addEventListener('pointerup', () => endDrag());
+window.addEventListener('pointercancel', () => endDrag());
+dial.addEventListener('pointerup', () => endDrag());
+dial.addEventListener('pointercancel', () => endDrag());
 
 /* ============ 中央按钮 & 进度条 & 灵敏度 ============ */
 centerBtn.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
@@ -401,6 +409,8 @@ sensEl.addEventListener('input', () => {
 });
 
 /* ============ 启动 ============ */
+var jsOk = document.getElementById('jsok');
+if (jsOk) jsOk.style.display = 'block';   // 只要这段能跑，就显示“JS 运行中”，便于排查
 syncSensUI();
 startLoop();
 loadStored();
