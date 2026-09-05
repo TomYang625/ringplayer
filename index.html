@@ -12,7 +12,7 @@
 <style>
   :root{
     --bg:#121016; --surface:#1a1720; --surface2:#211e29; --chip:#332b61;
-    --txt:#e9e7ee; --sub:#b9b4c2; --accent:#b9a7ff; --track:#2a2734; --err:#ffb4ab;
+    --txt:#e9e7ee; --sub:#b9b4c2; --accent:#E9EDF2; --track:#9AA1AB; --err:#ffb4ab;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{margin:0;height:100%}
@@ -37,10 +37,12 @@
   #hole{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border-radius:50%;background:var(--bg);width:58%;height:58%}
   #knobWrap{position:absolute;left:50%;top:50%;width:0;height:0;transform-origin:0 0;transform:rotate(0deg);pointer-events:none}
   #knob{position:absolute;left:-6px;top:0;width:12px;height:12px;border-radius:50%;background:var(--accent)}
+  #scrubTip{position:absolute;left:50%;top:8%;transform:translateX(-50%);display:none;pointer-events:none;background:var(--surface2);color:var(--accent);font-size:15px;font-weight:600;padding:4px 14px;border-radius:14px;white-space:nowrap;letter-spacing:.3px;z-index:5}
   #centerBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34%;aspect-ratio:1/1;border-radius:50%;border:0;background:var(--surface2);color:var(--txt);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}
   #centerBtn svg{width:40%;height:40%}
   #centerBtn:active{opacity:.8}
-  #timeRow{display:flex;justify-content:space-between;font-size:12px;color:var(--sub);font-variant-numeric:tabular-nums;margin-top:2px}
+  #timeRow{display:flex;justify-content:space-between;font-size:16px;color:var(--sub);font-variant-numeric:tabular-nums;margin-top:2px}
+  #cur{color:var(--accent);font-weight:600}
   #seek{width:100%;accent-color:var(--accent);margin:2px 0 6px}
   #hint{text-align:center;font-size:12px;color:var(--sub);margin-bottom:8px}
   #tracksHead{display:flex;align-items:center;justify-content:space-between;font-size:13px;color:var(--sub)}
@@ -81,6 +83,7 @@
       <div id="disc"></div>
       <div id="hole"></div>
       <div id="knobWrap"><div id="knob"></div></div>
+      <div id="scrubTip"></div>
       <button id="centerBtn" aria-label="播放或暂停">
         <svg id="playIcon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
         <svg id="pauseIcon" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
@@ -182,7 +185,20 @@ function layout() {
   knobWrap.style.left = geo.cx + 'px'; knobWrap.style.top = geo.cy + 'px';
   A('knob').style.top = -(geo.mid + 6) + 'px';
 }
-window.addEventListener('resize', () => { layout(); paint(); });
+// 圆环尺寸直接用像素写死：不依赖 aspect-ratio / min()，避免容器算成 0 导致环不显示
+function sizeDial() {
+  const wrap = document.getElementById('dialWrap').getBoundingClientRect();
+  let availW = window.innerWidth;
+  let availH = window.innerHeight;
+  if (wrap && wrap.width > 0) availW = wrap.width;
+  if (wrap && wrap.height > 0) availH = wrap.height;
+  const side = Math.max(120, Math.min(availW, availH, 360));
+  dial.style.width = side + 'px';
+  dial.style.height = side + 'px';
+  layout();
+  paint();
+}
+window.addEventListener('resize', () => sizeDial());
 
 /* ============ 进度绘制 ============ */
 function fracNow() {
@@ -349,12 +365,17 @@ dial.addEventListener('pointermove', (e) => {
     dragTarget = target;
     try { audio.currentTime = target / 1000; } catch (err) {}
     paint();
+    const tip = A('scrubTip');
+    if (tip) { tip.textContent = fmt(target); tip.style.display = 'block'; }
   }
 });
 function endDrag() {
-  if (!dragState.active) return;
-  dragState.active = false; dragging = false;
-  const k = curKey(); if (k) { posMap[k] = dragTarget; LS.set('posMap', posMap); }
+  if (dragState.active) {
+    dragState.active = false; dragging = false;
+    const k = curKey(); if (k) { posMap[k] = dragTarget; LS.set('posMap', posMap); }
+  }
+  const tip = A('scrubTip');
+  if (tip) tip.style.display = 'none';
 }
 dial.addEventListener('pointerup', endDrag);
 dial.addEventListener('pointercancel', endDrag);
@@ -383,12 +404,9 @@ sensEl.addEventListener('input', () => {
 syncSensUI();
 startLoop();
 loadStored();
-layout();
-// 监听圆环尺寸变化：防止首帧测量为 0 导致环不显示；尺寸一确定就重排重画
+sizeDial();
 if ('ResizeObserver' in window) {
-  new ResizeObserver(function () { layout(); paint(); }).observe(dial);
-} else {
-  window.addEventListener('resize', function () { layout(); paint(); });
+  new ResizeObserver(function () { sizeDial(); }).observe(dial);
 }
 
 if ('serviceWorker' in navigator &&
