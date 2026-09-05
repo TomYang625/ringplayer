@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#121016">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<title>环形播放器</title>
+<style>
+  :root{
+    --bg:#121016; --surface:#1a1720; --surface2:#211e29; --chip:#332b61;
+    --txt:#e9e7ee; --sub:#b9b4c2; --accent:#b9a7ff; --track:#2a2734; --err:#ffb4ab;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Roboto,sans-serif;overflow:hidden}
+  #app{height:100%;max-width:520px;margin:0 auto;display:flex;flex-direction:column;padding:max(12px,env(safe-area-inset-top)) 16px calc(10px + env(safe-area-inset-bottom));position:relative}
+  header{display:flex;align-items:center;gap:8px}
+  .head-txt{flex:1;min-width:0}
+  #title{font-size:18px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #subtitle{font-size:12px;color:var(--sub);margin-top:2px}
+  #errorMsg{font-size:12px;color:var(--err);margin-top:4px;display:none}
+  .btn{flex:none;border:0;border-radius:20px;background:var(--chip);color:var(--txt);font-size:13px;height:34px;padding:0 12px;cursor:pointer}
+  .btn:active{opacity:.7}
+  #panel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
+  #panel .row{display:flex;align-items:center;gap:10px}
+  #panel input[type=range]{flex:1}
+  #panel small{color:var(--sub)}
+  #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
+  #dial{position:relative;width:min(80vw,70vh,360px);aspect-ratio:1/1;touch-action:none;user-select:none;-webkit-user-select:none}
+  #discBase,#disc{position:absolute;border-radius:50%}
+  #discBase{background:var(--track)}
+  #disc{background:conic-gradient(from -90deg, var(--accent) 0deg 0deg, transparent 0deg)}
+  #hole{position:absolute;border-radius:50%;background:var(--bg)}
+  #knobWrap{position:absolute;left:50%;top:50%;width:0;height:0;transform-origin:0 0;transform:rotate(0deg);pointer-events:none}
+  #knob{position:absolute;left:-6px;top:0;width:12px;height:12px;border-radius:50%;background:var(--accent)}
+  #centerBtn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:34%;aspect-ratio:1/1;border-radius:50%;border:0;background:var(--surface2);color:var(--txt);display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}
+  #centerBtn svg{width:40%;height:40%}
+  #centerBtn:active{opacity:.8}
+  #timeRow{display:flex;justify-content:space-between;font-size:12px;color:var(--sub);font-variant-numeric:tabular-nums;margin-top:2px}
+  #seek{width:100%;accent-color:var(--accent);margin:2px 0 6px}
+  #hint{text-align:center;font-size:12px;color:var(--sub);margin-bottom:8px}
+  #tracksHead{display:flex;align-items:center;justify-content:space-between;font-size:13px;color:var(--sub)}
+  #list{list-style:none;margin:6px 0 0;padding:0;overflow-y:auto;max-height:26vh}
+  #list li{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px}
+  #list li.current{background:var(--surface2)}
+  #list li .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}
+  #list li button{flex:none;border:0;background:transparent;color:var(--sub);font-size:13px;padding:2px 6px;border-radius:6px}
+  #list li button:hover{background:var(--surface2)}
+  #fileInput{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="head-txt">
+      <div id="title">环形播放器</div>
+      <div id="subtitle">点右上角「打开」选择 mp3</div>
+      <div id="errorMsg"></div>
+    </div>
+    <button class="btn" id="btnSens">灵敏度</button>
+    <button class="btn" id="btnOpen">打开</button>
+  </header>
+
+  <div id="panel" hidden>
+    <div class="row">
+      <span style="font-size:13px;white-space:nowrap">一整圈≈</span>
+      <b id="sensVal">30 秒</b>
+      <input type="range" id="sens" min="1" max="600" step="1" value="30">
+      <button class="btn" id="sensReset" style="height:28px;padding:0 8px">默认</button>
+    </div>
+    <small>顺时针转 = 前进，逆时针 = 后退；数值越大，同样滑动跳过的时长越多。</small>
+  </div>
+
+  <div id="dialWrap">
+    <div id="dial">
+      <div id="discBase"></div>
+      <div id="disc"></div>
+      <div id="hole"></div>
+      <div id="knobWrap"><div id="knob"></div></div>
+      <button id="centerBtn" aria-label="播放或暂停">
+        <svg id="playIcon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="pauseIcon" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
+  <input type="range" id="seek" min="0" max="1000" value="0">
+  <div id="hint">顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停</div>
+
+  <div id="tracksHead"><span>我的歌曲</span><button class="btn" id="btnAddMore" style="height:26px;padding:0 8px">+ 添加</button></div>
+  <ul id="list"></ul>
+
+  <input type="file" id="fileInput" accept="audio/*,.mp3,.m4a,.wav,.ogg,.aac,.flac" multiple>
+</div>
+
+<script>
+'use strict';
+/* ============ 常量 / 工具 ============ */
+const A = id => document.getElementById(id);
+const audio = new Audio();
+audio.preload = 'auto';
+let tracks = [];        // {key,name,blob,url}
+let cur = -1;
+let duration = 0;
+let dragging = false;
+let dragTarget = 0;
+let rafId = null;
+
+const TWO_PI = Math.PI * 2;
+const fmt = ms => {
+  ms = Math.max(0, ms);
+  const t = Math.floor(ms / 1000), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  const p = n => (n < 10 ? '0' + n : '' + n);
+  return h > 0 ? h + ':' + p(m) + ':' + p(s) : m + ':' + p(s);
+};
+
+/* ============ 设置 ============ */
+const LS = {
+  get(o, d) { try { const v = localStorage.getItem(o); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(o, v) { try { localStorage.setItem(o, JSON.stringify(v)); } catch (e) {} }
+};
+let secondsPerTurn = LS.get('spt', 30);
+let posMap = LS.get('posMap', {});
+const curKey = () => (cur >= 0 && tracks[cur]) ? tracks[cur].key : null;
+
+/* ============ IndexedDB：记住选过的几首歌 ============ */
+const CAP_COUNT = 6, CAP_BYTES = 300 * 1024 * 1024;
+let db = null;
+function openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open('ringplayer', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('tracks', { keyPath: 'key' });
+    req.onsuccess = () => { db = req.result; res(); };
+    req.onerror = () => rej(req.error);
+  });
+}
+function dbPut(rec) { return new Promise(r => { const t = db.transaction('tracks', 'readwrite'); t.objectStore('tracks').put(rec); t.oncomplete = r; }); }
+function dbGetAll() { return new Promise(r => { const t = db.transaction('tracks', 'readonly'); const q = t.objectStore('tracks').getAll(); q.onsuccess = () => r(q.result || []); }); }
+function dbDelete(key) { return new Promise(r => { const t = db.transaction('tracks', 'readwrite'); t.objectStore('tracks').delete(key); t.oncomplete = r; }); }
+async function persistFile(file) {
+  if (!db) return;
+  const key = file.name + '|' + file.size + '|' + (file.lastModified || 0);
+  const rows = await dbGetAll();
+  if (rows.some(x => x.key === key)) return;
+  let total = rows.reduce((s, x) => s + (x.blob ? x.blob.size : 0), 0);
+  if (rows.length >= CAP_COUNT || total + file.size > CAP_BYTES) return; // 超出容量：仅本次会话可用
+  try { await dbPut({ key, name: file.name, blob: file }); } catch (e) { /* 空间不足则忽略 */ }
+}
+
+/* ============ DOM ============ */
+const dial = A('dial'), disc = A('disc'), discBase = A('discBase'), hole = A('hole'),
+      knobWrap = A('knobWrap'), centerBtn = A('centerBtn'),
+      playIcon = A('playIcon'), pauseIcon = A('pauseIcon'),
+      curEl = A('cur'), durEl = A('dur'), seekEl = A('seek'),
+      titleEl = A('title'), subEl = A('subtitle'), errEl = A('errorMsg'),
+      listEl = A('list'), fileInput = A('fileInput'),
+      panel = A('panel'), sensEl = A('sens'), sensVal = A('sensVal'),
+      btnOpen = A('btnOpen'), btnSens = A('btnSens'), sensReset = A('sensReset'), btnAddMore = A('btnAddMore');
+
+function setErr(s) { errEl.textContent = s || ''; errEl.style.display = s ? 'block' : 'none'; }
+
+/* ============ 环形绘制尺寸 ============ */
+let geo = { cx: 0, cy: 0, outer: 0, inner: 0, mid: 0, W: 0, H: 0 };
+function layout() {
+  const r = dial.getBoundingClientRect();
+  const side = Math.min(r.width, r.height);
+  geo.W = r.width; geo.H = r.height;
+  geo.cx = r.width / 2; geo.cy = r.height / 2;
+  geo.outer = side * 0.46;
+  geo.inner = side * 0.32;
+  geo.mid = (geo.outer + geo.inner) / 2;
+  const D = (x) => (x * 2).toFixed(1) + 'px';
+  discBase.style.width = D(geo.outer); discBase.style.height = D(geo.outer);
+  discBase.style.left = (geo.cx - geo.outer) + 'px'; discBase.style.top = (geo.cy - geo.outer) + 'px';
+  disc.style.width = D(geo.outer); disc.style.height = D(geo.outer);
+  disc.style.left = (geo.cx - geo.outer) + 'px'; disc.style.top = (geo.cy - geo.outer) + 'px';
+  hole.style.width = D(geo.inner); hole.style.height = D(geo.inner);
+  hole.style.left = (geo.cx - geo.inner) + 'px'; hole.style.top = (geo.cy - geo.inner) + 'px';
+  knobWrap.style.left = geo.cx + 'px'; knobWrap.style.top = geo.cy + 'px';
+  A('knob').style.top = -(geo.mid + 6) + 'px';
+}
+window.addEventListener('resize', () => { layout(); paint(); });
+
+/* ============ 进度绘制 ============ */
+function fracNow() {
+  if (!duration) return 0;
+  return Math.min(1, Math.max(0, (dragging ? dragTarget : audio.currentTime * 1000) / duration));
+}
+function paint() {
+  const f = fracNow();
+  const deg = Math.round(f * 360);
+  disc.style.background = 'conic-gradient(from -90deg, var(--accent) 0deg ' + deg + 'deg, transparent ' + deg + 'deg)';
+  knobWrap.style.transform = 'rotate(' + deg + 'deg)';
+  curEl.textContent = fmt(dragging ? dragTarget : audio.currentTime * 1000);
+  durEl.textContent = fmt(duration);
+  seekEl.value = Math.round(f * 1000);
+}
+function rafLoop() { paint(); rafId = requestAnimationFrame(rafLoop); }
+function startLoop() { if (!rafId) rafId = requestAnimationFrame(rafLoop); }
+function stopLoop() { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } }
+
+/* ============ 播放核心 ============ */
+function setPlaying(playing) {
+  playIcon.style.display = playing ? 'none' : 'block';
+  pauseIcon.style.display = playing ? 'block' : 'none';
+}
+function revoke(t) { if (t && t.url) { URL.revokeObjectURL(t.url); t.url = null; } }
+
+function playCurrent() {
+  const t = tracks[cur];
+  if (!t) return;
+  if (!t.url) t.url = URL.createObjectURL(t.blob);
+  audio.src = t.url;
+  duration = 0;
+  const pos = posMap[t.key] || 0;
+  const p = audio.play ? audio.play.bind(audio) : ()=>{};
+  audio.onloadedmetadata = () => {
+    duration = audio.duration * 1000;
+    if (pos > 0 && pos < duration) { try { audio.currentTime = pos / 1000; } catch (e) {} }
+    subEl.textContent = '已就绪';
+  };
+  audio.onended = () => { posMap[t.key] = 0; LS.set('posMap', posMap); setPlaying(false); paint(); };
+  audio.onerror = () => setErr('无法播放该文件');
+  audio.ontimeupdate = () => {
+    if (!dragging) {
+      if (Math.random() < 0.15) { posMap[t.key] = audio.currentTime * 1000; LS.set('posMap', posMap); }
+      paint();
+    }
+  };
+  // 不自动播放，等用户点中央（符合浏览器自动播放策略）
+}
+
+function selectTrack(i, autoplay) {
+  if (i === cur) { if (autoplay) toggle(); return; }
+  cur = i; dragging = false;
+  audio.pause();
+  revoke(tracks[cur]);          // 上一首的 url 可复用给当前，安全起见重新生成
+  const keep = tracks[i]; keep.url = null;
+  titleEl.textContent = keep.name;
+  playCurrent();
+  renderList();
+  if (autoplay) toggle();
+  else subEl.textContent = '点击中央开始播放';
+}
+
+function toggle() {
+  if (cur < 0) { openFiles(); return; }
+  if (audio.paused) {
+    const pr = audio.play();
+    if (pr && pr.catch) pr.catch(() => setErr('需再点一次播放（浏览器自动播放限制）'));
+    setPlaying(true);
+  } else {
+    audio.pause(); setPlaying(false);
+    const k = curKey(); if (k) { posMap[k] = audio.currentTime * 1000; LS.set('posMap', posMap); }
+  }
+}
+
+/* ============ 选文件 ============ */
+function openFiles() {
+  if (!db) openDB();
+  fileInput.click();
+}
+fileInput.addEventListener('change', async () => {
+  const files = Array.from(fileInput.files || []);
+  fileInput.value = '';
+  if (!files.length) return;
+  let added = [];
+  for (const f of files) {
+    tracks.push({ key: f.name + '|' + f.size + '|' + (f.lastModified || 0), name: f.name, blob: f, url: null });
+    added.push(persistFile(f));
+  }
+  await Promise.all(added);
+  renderList();
+  selectTrack(tracks.length - files.length, true);
+});
+btnOpen.addEventListener('click', openFiles);
+btnAddMore.addEventListener('click', openFiles);
+
+/* ============ 列表渲染 / 从库里加载 ============ */
+function renderList() {
+  listEl.innerHTML = '';
+  tracks.forEach((t, i) => {
+    const li = document.createElement('li');
+    if (i === cur) li.className = 'current';
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = t.name;
+    const play = document.createElement('button'); play.textContent = '播放';
+    const del = document.createElement('button'); del.textContent = '删除';
+    play.addEventListener('click', () => selectTrack(i, true));
+    del.addEventListener('click', async () => {
+      const k = t.key;
+      if (k) { posMap[k] = 0; LS.set('posMap', posMap); if (db) await dbDelete(k); }
+      revoke(t);
+      const wasCur = i === cur;
+      tracks.splice(i, 1);
+      if (cur >= tracks.length) cur = tracks.length - 1;
+      if (wasCur) { audio.pause(); if (cur >= 0) selectTrack(cur, false); else { cur = -1; titleEl.textContent = '环形播放器'; setPlaying(false); paint(); } }
+      renderList();
+    });
+    li.appendChild(nm); li.appendChild(play); li.appendChild(del);
+    listEl.appendChild(li);
+  });
+}
+async function loadStored() {
+  try { await openDB(); } catch (e) { return; }
+  let rows = [];
+  try { rows = await dbGetAll(); } catch (e) {}
+  rows = rows.filter(x => x.blob).slice(0, CAP_COUNT);
+  for (const x of rows) tracks.push({ key: x.key, name: x.name, blob: x.blob, url: null });
+  if (tracks.length) { renderList(); selectTrack(0, false); }
+  else { subEl.textContent = '点右上角「打开」选择 mp3'; }
+}
+
+/* ============ 环形滑动（快进/退） ============ */
+function angleOf(px, py) {
+  const dx = px - geo.cx, dy = py - geo.cy;
+  return Math.atan2(dy, dx); // 屏幕 y 向下 → 顺时针为正
+}
+let dragState = { active: false, base: 0, acc: 0, last: null };
+function dist(p) { return Math.hypot(p.clientX - geo.cx, p.clientY - geo.cy); }
+
+dial.addEventListener('pointerdown', (e) => {
+  if (e.button !== undefined && e.button !== 0) return;
+  const d = dist(e);
+  if (d <= geo.inner + 2 || d > geo.outer + 8) return; // 中央交给按钮；环带内才开始
+  if (!duration || cur < 0) { setErr('请先选择并播放一首歌再转动'); return; }
+  e.preventDefault();
+  dragState.active = true;
+  dragState.base = audio.currentTime * 1000;
+  dragState.acc = 0;
+  dragState.last = angleOf(e.clientX, e.clientY);
+  dragging = true;
+  dragTarget = dragState.base;
+  dial.setPointerCapture && dial.setPointerCapture(e.pointerId);
+});
+dial.addEventListener('pointermove', (e) => {
+  if (!dragState.active) return;
+  e.preventDefault();
+  const a = angleOf(e.clientX, e.clientY);
+  let delta = a - dragState.last;
+  if (delta > Math.PI) delta -= TWO_PI; else if (delta < -Math.PI) delta += TWO_PI;
+  dragState.last = a;
+  if (delta !== 0) {
+    dragState.acc += delta;
+    const msPerRad = secondsPerTurn * 1000 / TWO_PI;
+    const target = Math.max(0, Math.min(dragState.base + dragState.acc * msPerRad, duration));
+    dragTarget = target;
+    try { audio.currentTime = target / 1000; } catch (err) {}
+    paint();
+  }
+});
+function endDrag() {
+  if (!dragState.active) return;
+  dragState.active = false; dragging = false;
+  const k = curKey(); if (k) { posMap[k] = dragTarget; LS.set('posMap', posMap); }
+}
+dial.addEventListener('pointerup', endDrag);
+dial.addEventListener('pointercancel', endDrag);
+
+/* ============ 中央按钮 & 进度条 & 灵敏度 ============ */
+centerBtn.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+seekEl.addEventListener('input', () => {
+  if (!duration) return;
+  const t = seekEl.value / 1000 * duration;
+  dragging = true; dragTarget = t; audio.currentTime = t / 1000; paint();
+});
+seekEl.addEventListener('change', () => { dragging = false; paint(); });
+function syncSensUI() {
+  sensEl.value = secondsPerTurn;
+  sensVal.textContent = Math.round(secondsPerTurn) + ' 秒';
+}
+btnSens.addEventListener('click', () => { panel.hidden = !panel.hidden; });
+sensReset.addEventListener('click', () => { secondsPerTurn = 30; LS.set('spt', 30); syncSensUI(); });
+sensEl.addEventListener('input', () => {
+  secondsPerTurn = parseFloat(sensEl.value);
+  sensVal.textContent = Math.round(secondsPerTurn) + ' 秒';
+  LS.set('spt', secondsPerTurn);
+});
+
+/* ============ 启动 ============ */
+syncSensUI();
+layout();
+startLoop();
+loadStored();
+
+if ('serviceWorker' in navigator &&
+    (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  navigator.serviceWorker.register('sw.js').catch(function () { /* 忽略 */ });
+}
+</script>
+</body>
+</html>
