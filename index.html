@@ -26,10 +26,13 @@
   #jsok{display:none;color:#7bd88f;font-size:11px;margin-top:4px}
   .btn{flex:none;border:0;border-radius:20px;background:var(--chip);color:var(--txt);font-size:13px;height:34px;padding:0 12px;cursor:pointer}
   .btn:active{opacity:.7}
-  #panel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
-  #panel .row{display:flex;align-items:center;gap:10px}
-  #panel input[type=range]{flex:1}
-  #panel small{color:var(--sub)}
+  #panel,#ratePanel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
+  #panel .row,#ratePanel .row{display:flex;align-items:center;gap:10px}
+  #panel input[type=range],#ratePanel input[type=range]{flex:1}
+  #panel small,#ratePanel small{color:var(--sub)}
+  #rateChips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
+  #rateChips button{flex:1;min-width:0;border:0;border-radius:12px;background:var(--chip);color:var(--txt);height:30px;font-size:13px;cursor:pointer}
+  #rateChips button.active{background:var(--accent);color:#121016;font-weight:700}
   #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
   #dial{position:relative;width:min(80vw,70vh,360px);aspect-ratio:1/1;touch-action:none;user-select:none;-webkit-user-select:none}
   #discBase,#disc{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border-radius:50%}
@@ -65,6 +68,7 @@
       <div id="errorMsg"></div>
       <div id="jsok">JS 运行中</div>
     </div>
+    <button class="btn" id="btnRate">倍速</button>
     <button class="btn" id="btnSens">灵敏度</button>
     <button class="btn" id="btnOpen">打开</button>
   </header>
@@ -77,6 +81,17 @@
       <button class="btn" id="sensReset" style="height:28px;padding:0 8px">默认</button>
     </div>
     <small>顺时针转 = 前进，逆时针 = 后退；数值越大，同样滑动跳过的时长越多。</small>
+  </div>
+
+  <div id="ratePanel" hidden>
+    <div class="row">
+      <span style="font-size:13px;white-space:nowrap">播放倍速</span>
+      <b id="rateVal">1.0×</b>
+      <input type="range" id="rate" min="0.5" max="2" step="0.05" value="1">
+      <button class="btn" id="rateReset" style="height:28px;padding:0 8px">默认</button>
+    </div>
+    <div id="rateChips"></div>
+    <small>0.5×–2.0×，小于 1× 为慢速播放；选完即生效，换歌后仍保持。</small>
   </div>
 
   <div id="dialWrap">
@@ -130,6 +145,8 @@ const LS = {
   set(o, v) { try { localStorage.setItem(o, JSON.stringify(v)); } catch (e) {} }
 };
 let secondsPerTurn = LS.get('spt', 30);
+const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
+let rate = LS.get('rate', 1);
 let posMap = LS.get('posMap', {});
 const curKey = () => (cur >= 0 && tracks[cur]) ? tracks[cur].key : null;
 
@@ -165,7 +182,9 @@ const dial = A('dial'), disc = A('disc'), discBase = A('discBase'), hole = A('ho
       titleEl = A('title'), subEl = A('subtitle'), errEl = A('errorMsg'),
       listEl = A('list'), fileInput = A('fileInput'),
       panel = A('panel'), sensEl = A('sens'), sensVal = A('sensVal'),
-      btnOpen = A('btnOpen'), btnSens = A('btnSens'), sensReset = A('sensReset'), btnAddMore = A('btnAddMore');
+      ratePanel = A('ratePanel'), rateEl = A('rate'), rateVal = A('rateVal'), rateChips = A('rateChips'),
+      btnOpen = A('btnOpen'), btnSens = A('btnSens'), sensReset = A('sensReset'),
+      btnRate = A('btnRate'), rateReset = A('rateReset'), btnAddMore = A('btnAddMore');
 
 function setErr(s) { errEl.textContent = s || ''; errEl.style.display = s ? 'block' : 'none'; }
 
@@ -233,10 +252,13 @@ function playCurrent() {
   if (!t.url) t.url = URL.createObjectURL(t.blob);
   audio.src = t.url;
   duration = 0;
+  audio.defaultPlaybackRate = rate;   // 换 src 会重置倍速为 1，这里重新应用
+  audio.playbackRate = rate;
   const pos = posMap[t.key] || 0;
   const p = audio.play ? audio.play.bind(audio) : ()=>{};
   audio.onloadedmetadata = () => {
     duration = audio.duration * 1000;
+    audio.playbackRate = rate;
     if (pos > 0 && pos < duration) { try { audio.currentTime = pos / 1000; } catch (e) {} }
     subEl.textContent = '已就绪';
   };
@@ -400,13 +422,51 @@ function syncSensUI() {
   sensEl.value = secondsPerTurn;
   sensVal.textContent = Math.round(secondsPerTurn) + ' 秒';
 }
-btnSens.addEventListener('click', () => { panel.hidden = !panel.hidden; });
+btnSens.addEventListener('click', () => {
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) ratePanel.hidden = true;
+});
 sensReset.addEventListener('click', () => { secondsPerTurn = 30; LS.set('spt', 30); syncSensUI(); });
 sensEl.addEventListener('input', () => {
   secondsPerTurn = parseFloat(sensEl.value);
   sensVal.textContent = Math.round(secondsPerTurn) + ' 秒';
   LS.set('spt', secondsPerTurn);
 });
+
+/* ============ 倍速 ============ */
+function fmtRate(v) {
+  const r = Math.round(v * 100) / 100;
+  const s = r.toFixed(2).replace(/0+$/, '');
+  return (s.endsWith('.') ? s + '0' : s) + '×';
+}
+function applyRate(v) {
+  rate = Math.min(2, Math.max(0.5, v));
+  audio.defaultPlaybackRate = rate;
+  audio.playbackRate = rate;
+  LS.set('rate', rate);
+  syncRateUI();
+}
+function syncRateUI() {
+  rateEl.value = rate;
+  rateVal.textContent = fmtRate(rate);
+  [...rateChips.children].forEach(b =>
+    b.classList.toggle('active', Math.abs(parseFloat(b.dataset.rate) - rate) < 1e-6));
+}
+RATES.forEach(v => {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.dataset.rate = v;
+  b.textContent = fmtRate(v);
+  b.addEventListener('click', () => applyRate(v));
+  rateChips.appendChild(b);
+});
+rateEl.addEventListener('input', () => applyRate(parseFloat(rateEl.value)));
+rateReset.addEventListener('click', () => applyRate(1));
+btnRate.addEventListener('click', () => {
+  ratePanel.hidden = !ratePanel.hidden;
+  if (!ratePanel.hidden) panel.hidden = true;
+});
+syncRateUI();
 
 /* ============ 启动 ============ */
 var jsOk = document.getElementById('jsok');
