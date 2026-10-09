@@ -551,7 +551,8 @@ const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
 // 带 __userFacing 的错：文案已经是可以直接给用户看的，不再走 subStart 里那套错误映射
 function subUserErr(msg) { const e = new Error(msg); e.__userFacing = true; return e; }
 
-const sub = { state: 'none', rec: null, dlPct: 0, t0: 0, totalSec: 0, err: '', warn: '' };
+const sub = { state: 'none', rec: null, phase: 'decode', dlPct: 0, dlLoaded: 0, dlTotal: 0,
+              device: '', t0: 0, totalSec: 0, err: '', warn: '' };
 let subJob = 0;            // 每次启动 +1，用来丢弃过期消息
 let subTimer = null;
 
@@ -578,8 +579,8 @@ self.onmessage = async (e) => {
       dtype: 'q8',
       device: dev,
       progress_callback: (x) => {
-        if (x.status === 'progress' && x.total)
-          self.postMessage({ type:'download', loaded: x.loaded, total: x.total });
+        if (x.status === 'progress' && x.loaded)
+          self.postMessage({ type:'download', loaded: x.loaded, total: x.total || 0, file: x.file || '' });
       },
     });
     let pipe;
@@ -590,6 +591,9 @@ self.onmessage = async (e) => {
       device = 'wasm';
       pipe = await mkPipe(device);
     }
+    // 模型真正就绪才叫"开始转写"。界面若靠"某个文件下到 100%"来猜，会被先下完的小文件
+    // （config.json 只有 2KB）骗到——73MB 的大文件还在下，界面却已经显示"转写中"了。
+    self.postMessage({ type:'ready', device });
 
     const asrOpts = { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 };
     // .en 是英语专用模型，传 language/task 会被硬报错；只有多语模型才需要（见"已核实的事实"表）
@@ -676,7 +680,8 @@ async function subStart() {
   const job = ++subJob;
   subClearTimer();
   cancelAsrJob();     // 保证任何时刻只有一条 Whisper 管线在跑（上一轮没跑完就先掐掉）
-  sub.state = 'running'; sub.err = ''; sub.warn = ''; sub.dlPct = 0; sub.t0 = Date.now();
+  sub.state = 'running'; sub.err = ''; sub.warn = ''; sub.t0 = Date.now();
+  sub.phase = 'decode'; sub.dlPct = 0; sub.dlLoaded = 0; sub.dlTotal = 0; sub.device = '';
   subWakeOn();
   sub.totalSec = (audio.duration || 0) || 0;
   renderSubPanel();
@@ -696,14 +701,20 @@ async function subStart() {
     }
     if (job !== subJob) return;
     sub.totalSec = samples.length / 16000;
+    sub.phase = 'prep';                 // 解码完毕 → 接下来是下载/加载模型
     renderSubPanel();
     let chunks = null;
     await startAsrJob({
       audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG,
       onMsg: (d) => {
         if (job !== subJob) return;
-        if (d.type === 'download') { sub.dlPct = d.total ? d.loaded / d.total : 0; renderSubPanel(); }
-        else if (d.type === 'done') { chunks = d.chunks; }
+        if (d.type === 'download') {
+          sub.dlLoaded = d.loaded; sub.dlTotal = d.total;
+          sub.dlPct = d.total ? d.loaded / d.total : 0;
+          renderSubPanel();
+        } else if (d.type === 'ready') {
+          sub.phase = 'transcribe'; sub.device = d.device || ''; renderSubPanel();
+        } else if (d.type === 'done') { chunks = d.chunks; }
       },
     });
     if (job !== subJob) return;
@@ -797,13 +808,33 @@ function renderSubPanel() {
   if (!tracks[cur]) st.textContent = '先选一首歌，再生成字幕';
   else if (sub.state === 'none') st.textContent = '字幕';
   else if (sub.state === 'ready') st.textContent = '生成字幕（英文 · 首次下载约 ' + SUB_MODELS[subModel].mb + 'MB）';
-  else if (sub.state === 'running') st.textContent = sub.dlPct < 1
-      ? '下载模型中 ' + Math.round(sub.dlPct * 100) + '%'
-      : '转写中 ' + Math.round((Date.now() - sub.t0) / 1000) + 's（音频 '
-        + Math.round(sub.totalSec) + 's，请保持屏幕常亮）';
-  else if (sub.state === 'done') st.textContent = '字幕已生成（' + sub.rec.chunks.length + ' 句）'
-      + (sub.warn ? '，但' + sub.warn : '');
+  else if (sub.state === 'running') {
+    // 三个阶段都带上"已用时长"：实时可见，用户就不必猜它是不是卡住了
+    const el = fmtElapsed((Date.now() - sub.t0) / 1000);
+    if (sub.phase === 'transcribe') {
+      st.textContent = '转写中…（已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's，请保持屏幕常亮）';
+    } else if (sub.phase === 'decode') {
+      st.textContent = '正在读取音频…（已用 ' + el + '）';
+    } else if (sub.dlLoaded === 0) {
+      // 首个进度事件到达前（要先把识别库从 CDN 拉下来）：说清楚在干什么，
+      // 否则这里会显示"已下载 0.0MB"十几秒，看着像卡住。
+      st.textContent = '正在加载识别库…（已用 ' + el + '）';
+    } else {
+      const mb = (sub.dlLoaded / 1048576).toFixed(1)
+        + (sub.dlTotal ? ' / ' + (sub.dlTotal / 1048576).toFixed(1) : '') + 'MB';
+      st.textContent = '正在准备模型…' + (sub.dlTotal ? Math.round(sub.dlPct * 100) + '%，' : '')
+        + '已下载 ' + mb + '（已用 ' + el + '，首次可能要几分钟）';
+    }
+  }
+  else if (sub.state === 'done') st.textContent = '字幕已生成（' + sub.rec.chunks.length + ' 句'
+      + (sub.device ? ' · ' + sub.device : '') + '）' + (sub.warn ? '，但' + sub.warn : '');
   else st.textContent = sub.err || '失败';
+}
+function fmtElapsed(sec) {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60), r = s % 60;
+  return r ? m + '分' + r + '秒' : m + '分钟';
 }
 function renderSubList() {
   subListEl.innerHTML = '';
