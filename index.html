@@ -26,14 +26,18 @@
   #jsok{display:none;color:#7bd88f;font-size:11px;margin-top:4px}
   .btn{flex:none;border:0;border-radius:20px;background:var(--chip);color:var(--txt);font-size:13px;height:34px;padding:0 12px;cursor:pointer}
   .btn:active{opacity:.7}
-  #panel,#ratePanel,#subPanel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
+  /* 面板是圆环容器内的浮层：不参与布局，所以开合既不改变圆环的空间（圆环大小不受面板/字幕影响），
+     也永远不会盖住容器外的字幕行；自身超高时内部滚动，最外还有容器 overflow:hidden 兜底。 */
+  #panel,#ratePanel,#subPanel{position:absolute;left:0;right:0;top:0;z-index:6;
+    background:var(--surface);border-radius:14px;padding:12px 14px;max-height:100%;overflow:auto;
+    box-shadow:0 8px 28px rgba(0,0,0,.5)}
   #panel .row,#ratePanel .row,#subPanel .row{display:flex;align-items:center;gap:10px}
   #panel input[type=range],#ratePanel input[type=range]{flex:1}
   #panel small,#ratePanel small,#subPanel small{color:var(--sub)}
   #rateChips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
   #rateChips button{flex:1;min-width:0;border:0;border-radius:12px;background:var(--chip);color:var(--txt);height:30px;font-size:13px;cursor:pointer}
   #rateChips button.active{background:var(--accent);color:#121016;font-weight:700}
-  #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;overflow:hidden}
+  #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;overflow:hidden;position:relative}
   #dial{position:relative;width:min(80vw,70vh,360px);aspect-ratio:1/1;touch-action:none;user-select:none;-webkit-user-select:none}
   #discBase,#disc{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border-radius:50%}
   #discBase{background:var(--track);width:86%;height:86%}
@@ -79,50 +83,50 @@
     <button class="btn" id="btnOpen">打开</button>
   </header>
 
-  <div id="panel" hidden>
-    <div class="row">
-      <span style="font-size:13px;white-space:nowrap">一整圈≈</span>
-      <b id="sensVal">30 秒</b>
-      <input type="range" id="sens" min="1" max="600" step="1" value="30">
-      <button class="btn" id="sensReset" style="height:28px;padding:0 8px">默认</button>
-    </div>
-    <small>顺时针转 = 前进，逆时针 = 后退；数值越大，同样滑动跳过的时长越多。</small>
-  </div>
-
-  <div id="ratePanel" hidden>
-    <div class="row">
-      <span style="font-size:13px;white-space:nowrap">播放倍速</span>
-      <b id="rateVal">1.0×</b>
-      <input type="range" id="rate" min="0.5" max="2" step="0.05" value="1">
-      <button class="btn" id="rateReset" style="height:28px;padding:0 8px">默认</button>
-    </div>
-    <div id="rateChips"></div>
-    <small>0.5×–2.0×，小于 1× 为慢速播放；选完即生效，换歌后仍保持。</small>
-  </div>
-
-  <div id="subPanel" hidden>
-    <div class="row"><b id="subStatus">字幕</b><span style="flex:1"></span>
-      <button class="btn" id="subStart" style="height:28px;padding:0 8px">生成字幕</button>
-      <button class="btn" id="subStop" style="height:28px;padding:0 8px" hidden>停止</button>
-      <button class="btn" id="subDel" style="height:28px;padding:0 8px" hidden>删除</button>
-    </div>
-    <div class="row" id="subModelRow">
-      <span style="font-size:13px;white-space:nowrap">模型</span>
-      <select id="subModel" style="flex:1">
-        <option value="tiny">tiny.en · 39MB · 最快</option>
-        <option value="base">base.en · 73MB · 推荐</option>
-        <option value="small">small.en · 238MB · 更准</option>
-      </select>
-    </div>
-    <div class="row" id="subExportRow" hidden>
-      <button class="btn" id="subSrt" style="height:28px;padding:0 8px">导出 .srt</button>
-      <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
-    </div>
-    <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。</small>
-    <div id="subList"></div>
-  </div>
-
   <div id="dialWrap">
+    <div id="panel" hidden>
+      <div class="row">
+        <span style="font-size:13px;white-space:nowrap">一整圈≈</span>
+        <b id="sensVal">30 秒</b>
+        <input type="range" id="sens" min="1" max="600" step="1" value="30">
+        <button class="btn" id="sensReset" style="height:28px;padding:0 8px">默认</button>
+      </div>
+      <small>顺时针转 = 前进，逆时针 = 后退；数值越大，同样滑动跳过的时长越多。</small>
+    </div>
+
+    <div id="ratePanel" hidden>
+      <div class="row">
+        <span style="font-size:13px;white-space:nowrap">播放倍速</span>
+        <b id="rateVal">1.0×</b>
+        <input type="range" id="rate" min="0.5" max="2" step="0.05" value="1">
+        <button class="btn" id="rateReset" style="height:28px;padding:0 8px">默认</button>
+      </div>
+      <div id="rateChips"></div>
+      <small>0.5×–2.0×，小于 1× 为慢速播放；选完即生效，换歌后仍保持。</small>
+    </div>
+
+    <div id="subPanel" hidden>
+      <div class="row"><b id="subStatus">字幕</b><span style="flex:1"></span>
+        <button class="btn" id="subStart" style="height:28px;padding:0 8px">生成字幕</button>
+        <button class="btn" id="subStop" style="height:28px;padding:0 8px" hidden>停止</button>
+        <button class="btn" id="subDel" style="height:28px;padding:0 8px" hidden>删除</button>
+      </div>
+      <div class="row" id="subModelRow">
+        <span style="font-size:13px;white-space:nowrap">模型</span>
+        <select id="subModel" style="flex:1">
+          <option value="tiny">tiny.en · 39MB · 最快</option>
+          <option value="base">base.en · 73MB · 推荐</option>
+          <option value="small">small.en · 238MB · 更准</option>
+        </select>
+      </div>
+      <div class="row" id="subExportRow" hidden>
+        <button class="btn" id="subSrt" style="height:28px;padding:0 8px">导出 .srt</button>
+        <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
+      </div>
+      <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。</small>
+      <div id="subList"></div>
+    </div>
+
     <div id="dial">
       <div id="discBase"></div>
       <div id="disc"></div>
@@ -779,7 +783,6 @@ function showPanel(name) {
   panel.hidden = name !== 'sens';
   ratePanel.hidden = name !== 'rate';
   subPanel.hidden = name !== 'sub';
-  sizeDial();   // 面板一开一合，容器高度就变了，圆环必须跟着重算，否则会溢出容器盖住下面的字幕行
 }
 function renderSubPanel() {
   const st = A('subStatus'), start = A('subStart'), stop = A('subStop'), del = A('subDel');
