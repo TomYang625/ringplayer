@@ -33,7 +33,7 @@
   #rateChips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
   #rateChips button{flex:1;min-width:0;border:0;border-radius:12px;background:var(--chip);color:var(--txt);height:30px;font-size:13px;cursor:pointer}
   #rateChips button.active{background:var(--accent);color:#121016;font-weight:700}
-  #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
+  #dialWrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;overflow:hidden}
   #dial{position:relative;width:min(80vw,70vh,360px);aspect-ratio:1/1;touch-action:none;user-select:none;-webkit-user-select:none}
   #discBase,#disc{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border-radius:50%}
   #discBase{background:var(--track);width:86%;height:86%}
@@ -277,7 +277,9 @@ function sizeDial() {
   let availH = window.innerHeight;
   if (wrap && wrap.width > 0) availW = wrap.width;
   if (wrap && wrap.height > 0) availH = wrap.height;
-  const side = Math.max(120, Math.min(availW, availH, 360));
+  // 下限只保 1px：容器被面板/文稿压矮时，圆环必须老老实实缩小，绝不允许溢出容器
+  // （溢出会被下面的字幕行"按盒子"压住；容器已设 overflow:hidden，但那只裁画面、不解决问题）
+  const side = Math.max(1, Math.min(availW, availH, 360));
   dial.style.width = side + 'px';
   dial.style.height = side + 'px';
   layout();
@@ -777,6 +779,7 @@ function showPanel(name) {
   panel.hidden = name !== 'sens';
   ratePanel.hidden = name !== 'rate';
   subPanel.hidden = name !== 'sub';
+  sizeDial();   // 面板一开一合，容器高度就变了，圆环必须跟着重算，否则会溢出容器盖住下面的字幕行
 }
 function renderSubPanel() {
   const st = A('subStatus'), start = A('subStart'), stop = A('subStop'), del = A('subDel');
@@ -868,7 +871,9 @@ startLoop();
 loadStored();
 sizeDial();
 if ('ResizeObserver' in window) {
-  new ResizeObserver(function () { sizeDial(); }).observe(dial);
+  // 盯容器而不是圆环本身：圆环的尺寸是这里写死的，它自己不会变，
+  // 变的是容器（面板开合、文稿变长、横竖屏切换），旧写法因此不会触发重算。
+  new ResizeObserver(function () { sizeDial(); }).observe(document.getElementById('dialWrap'));
 }
 
 if ('serviceWorker' in navigator &&
