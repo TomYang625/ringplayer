@@ -552,7 +552,7 @@ const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
 function subUserErr(msg) { const e = new Error(msg); e.__userFacing = true; return e; }
 
 const sub = { state: 'none', rec: null, phase: 'decode', dlPct: 0, dlLoaded: 0, dlTotal: 0,
-              device: '', t0: 0, totalSec: 0, err: '', warn: '' };
+              device: '', booted: false, lastAt: 0, t0: 0, totalSec: 0, err: '', warn: '' };
 let subJob = 0;            // 每次启动 +1，用来丢弃过期消息
 let subTimer = null;
 
@@ -561,7 +561,17 @@ const WORKER_SRC = `
 self.onmessage = async (e) => {
   const { audio, model, lang } = e.data;
   try {
-    const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1');
+    // 先报一声"我起来了"：万一浏览器不支持这种内联 Worker / 外部模块加载，
+    // 界面就能看出卡在哪一步，而不是只看到"已用 Xs"永远不动。
+    self.postMessage({ type:'boot' });
+    let mod;
+    try {
+      mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1');
+    } catch (err) {
+      self.postMessage({ type:'err', text:'识别库加载失败：' + String((err && err.message) || err) });
+      return;
+    }
+    const { pipeline, env } = mod;
     env.remoteHost = 'https://hf-mirror.com';
     env.allowLocalModels = false;
     // device 选择（与探针页保持一致）：偏好 webgpu，回退 wasm。
@@ -623,7 +633,12 @@ function cancelAsrJob() {
 
 async function startAsrJob({ audio, model, lang, onMsg }) {
   if (window.__asrStub) { await window.__asrStub(audio, model, onMsg); return; }
-  const w = createAsrWorker();
+  let w;
+  try { w = createAsrWorker(); }
+  catch (err) {
+    throw subUserErr('识别器启动失败：这个浏览器可能不支持内联 Worker（'
+      + String((err && err.message) || err) + '）');
+  }
   subWorker = w;
   const done = new Promise((resolve, reject) => {
     subWorkerCancel = () => { const e = new Error('已取消'); e.__asrCancelled = true; reject(e); };
@@ -682,6 +697,7 @@ async function subStart() {
   cancelAsrJob();     // 保证任何时刻只有一条 Whisper 管线在跑（上一轮没跑完就先掐掉）
   sub.state = 'running'; sub.err = ''; sub.warn = ''; sub.t0 = Date.now();
   sub.phase = 'decode'; sub.dlPct = 0; sub.dlLoaded = 0; sub.dlTotal = 0; sub.device = '';
+  sub.booted = false; sub.lastAt = Date.now();
   subWakeOn();
   sub.totalSec = (audio.duration || 0) || 0;
   renderSubPanel();
@@ -708,7 +724,9 @@ async function subStart() {
       audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG,
       onMsg: (d) => {
         if (job !== subJob) return;
-        if (d.type === 'download') {
+        sub.lastAt = Date.now();
+        if (d.type === 'boot') { sub.booted = true; renderSubPanel(); }
+        else if (d.type === 'download') {
           sub.dlLoaded = d.loaded; sub.dlTotal = d.total;
           sub.dlPct = d.total ? d.loaded / d.total : 0;
           renderSubPanel();
@@ -815,6 +833,11 @@ function renderSubPanel() {
       st.textContent = '转写中…（已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's，请保持屏幕常亮）';
     } else if (sub.phase === 'decode') {
       st.textContent = '正在读取音频…（已用 ' + el + '）';
+    } else if (!sub.booted) {
+      // Worker 还没回报"我起来了"。这一步在 Safari 上是有可能失败的（内联 Worker + 外部模块），
+      // 所以超过 10 秒就明说卡在哪，别让用户对着计时无限等。
+      st.textContent = '正在启动识别器…（已用 ' + el + '）'
+        + (Date.now() - sub.t0 > 10000 ? '——一直停在这里说明这个浏览器没能启动识别器，可点「停止」后重试' : '');
     } else if (sub.dlLoaded === 0) {
       // 首个进度事件到达前（要先把识别库从 CDN 拉下来）：说清楚在干什么，
       // 否则这里会显示"已下载 0.0MB"十几秒，看着像卡住。
@@ -823,7 +846,8 @@ function renderSubPanel() {
       const mb = (sub.dlLoaded / 1048576).toFixed(1)
         + (sub.dlTotal ? ' / ' + (sub.dlTotal / 1048576).toFixed(1) : '') + 'MB';
       st.textContent = '正在准备模型…' + (sub.dlTotal ? Math.round(sub.dlPct * 100) + '%，' : '')
-        + '已下载 ' + mb + '（已用 ' + el + '，首次可能要几分钟）';
+        + '已下载 ' + mb + '（已用 ' + el + '，首次可能要几分钟）'
+        + (Date.now() - sub.lastAt > 30000 ? '——已 30 秒无下载进展，可点「停止」后重试' : '');
     }
   }
   else if (sub.state === 'done') st.textContent = '字幕已生成（' + sub.rec.chunks.length + ' 句'
