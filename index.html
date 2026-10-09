@@ -123,7 +123,8 @@
         <button class="btn" id="subSrt" style="height:28px;padding:0 8px">导出 .srt</button>
         <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
       </div>
-      <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。</small>
+      <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。
+        档位差别很大：tiny.en 最快（先用它试通），base.en 更准但慢好几倍，small.en 最准也最慢。</small>
       <div id="subList"></div>
     </div>
 
@@ -542,7 +543,9 @@ const SUB_MODELS = {
   base:  { id: 'onnx-community/whisper-base.en',  mb: 73  },
   small: { id: 'onnx-community/whisper-small.en', mb: 238 },
 };
-let subModel = LS.get('subModel', 'base');
+// 默认 tiny.en：实测 base.en 在真机上等 7 分钟仍无结果（而 tiny.en 是它的约 1/4 体积、快得多）。
+// 要更准可在面板里改档；一旦选定会记在 localStorage 里，不会每次被改回。
+let subModel = LS.get('subModel', 'tiny');
 const SUB_LANG = 'en';
 const SUB_MAX_SEC = 30 * 60;   // 超过这个时长就别解了（见 subStart 里的说明）
 const SUB_TOO_LONG_ERR = '音频太长了，一次最多转写 30 分钟，先裁短再试';
@@ -605,7 +608,12 @@ self.onmessage = async (e) => {
     // （config.json 只有 2KB）骗到——73MB 的大文件还在下，界面却已经显示"转写中"了。
     self.postMessage({ type:'ready', device });
 
-    const asrOpts = { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 };
+    const asrOpts = {
+      return_timestamps: true, chunk_length_s: 30, stride_length_s: 5,
+      // 每生成一个 token 就报一声"还活着"。转写期间库不给进度（chunks 只在结束时返回），
+      // 没有这个信号就无法区分"慢但在跑"和"进程已被系统杀掉"——后者会让界面永远等着。
+      token_callback_function: () => self.postMessage({ type: 'alive' }),
+    };
     // .en 是英语专用模型，传 language/task 会被硬报错；只有多语模型才需要（见"已核实的事实"表）
     if (!/\\.en$/.test(model)) { asrOpts.language = lang; asrOpts.task = 'transcribe'; }
     const out = await pipe(audio, asrOpts);
@@ -830,7 +838,13 @@ function renderSubPanel() {
     // 三个阶段都带上"已用时长"：实时可见，用户就不必猜它是不是卡住了
     const el = fmtElapsed((Date.now() - sub.t0) / 1000);
     if (sub.phase === 'transcribe') {
-      st.textContent = '转写中…（已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's，请保持屏幕常亮）';
+      st.textContent = '转写中…（已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's，请保持屏幕常亮）'
+        // 阈值取 2 分钟：实测 token 回调在 ASR 上是"随内容密度"触发的（近乎静音时很少），
+        // 阈值太激进会在正常但缓慢的转写里误报"进程已被回收"。
+        + (Date.now() - sub.lastAt > 120000
+            ? '——已 2 分钟没有任何进展，识别进程可能已被系统回收（内存不足）。'
+              + '建议改用 tiny 档或更短的音频，点「停止」后重试'
+            : '');
     } else if (sub.phase === 'decode') {
       st.textContent = '正在读取音频…（已用 ' + el + '）';
     } else if (!sub.booted) {
