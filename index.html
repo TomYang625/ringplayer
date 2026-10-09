@@ -189,12 +189,20 @@ const dial = A('dial'), disc = A('disc'), discBase = A('discBase'), hole = A('ho
 function setErr(s) { errEl.textContent = s || ''; errEl.style.display = s ? 'block' : 'none'; }
 
 /* ============ 环形绘制尺寸 ============ */
-let geo = { cx: 0, cy: 0, outer: 0, inner: 0, mid: 0, W: 0, H: 0 };
+let geo = { cx: 0, cy: 0, vcx: 0, vcy: 0, outer: 0, inner: 0, mid: 0, W: 0, H: 0 };
+// 指针事件给的是 viewport 坐标（clientX/Y），而 geo.cx/cy 是 dial 的局部坐标（用于 CSS 定位）；
+// 两者不能混用，所以圆心另存一份 viewport 坐标给 dist()/angleOf() 用。
+function syncOrigin(r) {
+  r = r || dial.getBoundingClientRect();
+  geo.vcx = r.left + r.width / 2;
+  geo.vcy = r.top + r.height / 2;
+}
 function layout() {
   const r = dial.getBoundingClientRect();
   const side = Math.min(r.width, r.height);
   geo.W = r.width; geo.H = r.height;
   geo.cx = r.width / 2; geo.cy = r.height / 2;
+  syncOrigin(r);
   geo.outer = side * 0.46;
   geo.inner = side * 0.32;
   geo.mid = (geo.outer + geo.inner) / 2;
@@ -355,11 +363,11 @@ async function loadStored() {
 
 /* ============ 环形滑动（快进/退） ============ */
 function angleOf(px, py) {
-  const dx = px - geo.cx, dy = py - geo.cy;
+  const dx = px - geo.vcx, dy = py - geo.vcy;
   return Math.atan2(dy, dx); // 屏幕 y 向下 → 顺时针为正
 }
 let dragState = { active: false, base: 0, acc: 0, last: null };
-function dist(p) { return Math.hypot(p.clientX - geo.cx, p.clientY - geo.cy); }
+function dist(p) { return Math.hypot(p.clientX - geo.vcx, p.clientY - geo.vcy); }
 
 function scrubMove(clientX, clientY) {
   if (!dragState.active) return;
@@ -388,6 +396,7 @@ function endDrag() {
 }
 dial.addEventListener('pointerdown', (e) => {
   if (e.button !== undefined && e.button !== 0) return;
+  syncOrigin();                 // 面板开合只改位置不改尺寸时 ResizeObserver 不触发，按下时重算一次
   const d = dist(e);
   if (d <= geo.inner + 2) return; // 中央按钮交给 click；环带内任意处可开始
   if (!duration || cur < 0) { setErr('请先选一首歌并播放，再按住圆环转动'); return; }
