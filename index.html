@@ -110,7 +110,7 @@
 
   <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   <input type="range" id="seek" min="0" max="1000" value="0">
-  <div id="hint">顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停</div>
+  <div id="hint">顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 播完自动重播</div>
 
   <div id="tracksHead"><span>我的歌曲</span><button class="btn" id="btnAddMore" style="height:26px;padding:0 8px">+ 添加</button></div>
   <ul id="list"></ul>
@@ -252,6 +252,7 @@ function playCurrent() {
   if (!t.url) t.url = URL.createObjectURL(t.blob);
   audio.src = t.url;
   duration = 0;
+  audio.loop = true;                  // 单曲无限循环：播完自动从头再播
   audio.defaultPlaybackRate = rate;   // 换 src 会重置倍速为 1，这里重新应用
   audio.playbackRate = rate;
   const pos = posMap[t.key] || 0;
@@ -262,7 +263,6 @@ function playCurrent() {
     if (pos > 0 && pos < duration) { try { audio.currentTime = pos / 1000; } catch (e) {} }
     subEl.textContent = '已就绪';
   };
-  audio.onended = () => { posMap[t.key] = 0; LS.set('posMap', posMap); setPlaying(false); paint(); };
   audio.onerror = () => setErr('无法播放该文件');
   audio.ontimeupdate = () => {
     if (!dragging) {
