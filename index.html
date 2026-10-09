@@ -623,8 +623,8 @@ self.onmessage = async (e) => {
   }
 };
 `;
-function createAsrWorker() {
-  return new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })), { type: 'module' });
+function createAsrWorker(workerType) {
+  return new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })), { type: workerType });
 }
 
 // 正在跑的转写 worker。取消机制只有 terminate() 一条路：只靠 subJob 递增只是丢弃结果，
@@ -639,24 +639,34 @@ function cancelAsrJob() {
   if (subWorker) { try { subWorker.terminate(); } catch (e) {} subWorker = null; }
 }
 
-async function startAsrJob({ audio, model, lang, onMsg }) {
+async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module' }) {
   if (window.__asrStub) { await window.__asrStub(audio, model, onMsg); return; }
   let w;
-  try { w = createAsrWorker(); }
+  try { w = createAsrWorker(workerType); }
   catch (err) {
-    throw subUserErr('识别器启动失败：这个浏览器可能不支持内联 Worker（'
+    const e = subUserErr('识别器启动失败：这个浏览器可能不支持内联 Worker（'
       + String((err && err.message) || err) + '）');
+    e.__startupFailed = true;      // 构造就抛（旧 Safari 对模块型 Worker 会这样）→ 同样值得换形式重试
+    throw e;
   }
   subWorker = w;
+  let gotMessage = false;      // 收到过任何一条消息 = worker 确实跑起来了
   const done = new Promise((resolve, reject) => {
     subWorkerCancel = () => { const e = new Error('已取消'); e.__asrCancelled = true; reject(e); };
     w.onmessage = (e) => {
+      gotMessage = true;
       const d = e.data;
       onMsg(d);
       if (d.type === 'done') resolve();
       else if (d.type === 'err') reject(new Error(d.text));
     };
-    w.onerror = (e) => reject(new Error(e.message || 'worker 出错'));
+    w.onerror = (e) => {
+      const err = new Error((e && e.message) || 'worker 出错');
+      // 一条消息都没发出来就报错 = "没能跑起来"（多数是浏览器不支持这种内联 Worker 形式），
+      // 值得换个更兼容的形式重试；已经跑起来再报错属运行期问题，不重试。
+      err.__startupFailed = !gotMessage;
+      reject(err);
+    };
   });
   w.postMessage({ audio, model, lang }, [audio.buffer]);
   try { await done; }
@@ -728,8 +738,8 @@ async function subStart() {
     sub.phase = 'prep';                 // 解码完毕 → 接下来是下载/加载模型
     renderSubPanel();
     let chunks = null;
-    await startAsrJob({
-      audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG,
+    const runJob = (workerType) => startAsrJob({
+      audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG, workerType,
       onMsg: (d) => {
         if (job !== subJob) return;
         sub.lastAt = Date.now();
@@ -743,6 +753,20 @@ async function subStart() {
         } else if (d.type === 'done') { chunks = d.chunks; }
       },
     });
+    try {
+      await runJob('module');
+    } catch (e) {
+      if (!e || !e.__startupFailed) throw e;
+      // 模块型内联 Worker 一条消息都没发出来就挂了（旧版 Safari 常见）→ 换经典 Worker 形式再试一次。
+      // 上一次 postMessage 已经把 samples 的 buffer transfer 走了，所以必须重新解码。
+      sub.phase = 'decode'; sub.booted = false;
+      sub.dlLoaded = 0; sub.dlTotal = 0; sub.dlPct = 0;
+      renderSubPanel();
+      samples = await decodeToMono16k(t.blob);
+      if (job !== subJob) return;
+      sub.phase = 'prep'; renderSubPanel();
+      await runJob('classic');
+    }
     if (job !== subJob) return;
     // 库返回 chunks[].timestamp = [起, 止]；末段可能给 [起, null]，缺结束时间时用音频总时长兜底
     const chunksOut = (chunks || []).map(c => {
@@ -772,6 +796,9 @@ async function subStart() {
     if (e && e.__userFacing) sub.err = msg;   // 解码失败/超长：文案已经是给用户看的，不再映射
     else if (/memory|allocation|RangeError/i.test(msg)) sub.err = '内存不足：改用 base 或 tiny 档再试';
     else if (sub.dlPct < 1 && /fetch|network|HTTP|Failed/i.test(msg)) sub.err = '模型下载失败（检查网络/镜像），点重试';
+    else if (/worker 出错|识别器启动失败/.test(msg))
+      sub.err = '识别器没能启动：这个浏览器可能不支持离线识别所需的 Worker 方式（两种形式都试过了）。'
+              + '请把这一整行发给开发者——' + navigator.userAgent;
     else sub.err = '转写失败：' + msg;
     sub.state = 'error';
     subWakeOff();
