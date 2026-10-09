@@ -26,10 +26,10 @@
   #jsok{display:none;color:#7bd88f;font-size:11px;margin-top:4px}
   .btn{flex:none;border:0;border-radius:20px;background:var(--chip);color:var(--txt);font-size:13px;height:34px;padding:0 12px;cursor:pointer}
   .btn:active{opacity:.7}
-  #panel,#ratePanel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
-  #panel .row,#ratePanel .row{display:flex;align-items:center;gap:10px}
+  #panel,#ratePanel,#subPanel{background:var(--surface);border-radius:14px;padding:12px 14px;margin-top:8px}
+  #panel .row,#ratePanel .row,#subPanel .row{display:flex;align-items:center;gap:10px}
   #panel input[type=range],#ratePanel input[type=range]{flex:1}
-  #panel small,#ratePanel small{color:var(--sub)}
+  #panel small,#ratePanel small,#subPanel small{color:var(--sub)}
   #rateChips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px}
   #rateChips button{flex:1;min-width:0;border:0;border-radius:12px;background:var(--chip);color:var(--txt);height:30px;font-size:13px;cursor:pointer}
   #rateChips button.active{background:var(--accent);color:#121016;font-weight:700}
@@ -57,6 +57,11 @@
   #list li button{flex:none;border:0;background:transparent;color:var(--sub);font-size:13px;padding:2px 6px;border-radius:6px}
   #list li button:hover{background:var(--surface2)}
   #fileInput{display:none}
+  #subline{display:none;text-align:center;font-size:14px;color:var(--accent);margin:6px 2px 0;overflow:hidden;min-height:0}
+  #subline.on{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  #subList{max-height:30vh;overflow-y:auto;margin-top:6px;font-size:14px}
+  #subList .row{padding:5px 6px;border-radius:8px;cursor:pointer;color:var(--sub)}
+  #subList .row.on{background:var(--surface2);color:var(--txt);font-weight:600}
 </style>
 </head>
 <body>
@@ -68,6 +73,7 @@
       <div id="errorMsg"></div>
       <div id="jsok">JS 运行中</div>
     </div>
+    <button class="btn" id="btnSub">字幕</button>
     <button class="btn" id="btnRate">倍速</button>
     <button class="btn" id="btnSens">灵敏度</button>
     <button class="btn" id="btnOpen">打开</button>
@@ -94,6 +100,28 @@
     <small>0.5×–2.0×，小于 1× 为慢速播放；选完即生效，换歌后仍保持。</small>
   </div>
 
+  <div id="subPanel" hidden>
+    <div class="row"><b id="subStatus">字幕</b><span style="flex:1"></span>
+      <button class="btn" id="subStart" style="height:28px;padding:0 8px">生成字幕</button>
+      <button class="btn" id="subStop" style="height:28px;padding:0 8px" hidden>停止</button>
+      <button class="btn" id="subDel" style="height:28px;padding:0 8px" hidden>删除</button>
+    </div>
+    <div class="row" id="subModelRow">
+      <span style="font-size:13px;white-space:nowrap">模型</span>
+      <select id="subModel" style="flex:1">
+        <option value="tiny">tiny.en · 39MB · 最快</option>
+        <option value="base">base.en · 73MB · 推荐</option>
+        <option value="small">small.en · 238MB · 更准</option>
+      </select>
+    </div>
+    <div class="row" id="subExportRow" hidden>
+      <button class="btn" id="subSrt" style="height:28px;padding:0 8px">导出 .srt</button>
+      <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
+    </div>
+    <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。</small>
+    <div id="subList"></div>
+  </div>
+
   <div id="dialWrap">
     <div id="dial">
       <div id="discBase"></div>
@@ -108,6 +136,7 @@
     </div>
   </div>
 
+  <div id="subline"></div>
   <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   <input type="range" id="seek" min="0" max="1000" value="0">
   <div id="hint">顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 播完自动重播</div>
@@ -153,13 +182,40 @@ const curKey = () => (cur >= 0 && tracks[cur]) ? tracks[cur].key : null;
 /* ============ IndexedDB：记住选过的几首歌 ============ */
 const CAP_COUNT = 6, CAP_BYTES = 300 * 1024 * 1024;
 let db = null;
+/* ============ IndexedDB：字幕（v2 起） ============ */
+const DB_VERSION = 2;
 function openDB() {
   return new Promise((res, rej) => {
-    const req = indexedDB.open('ringplayer', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('tracks', { keyPath: 'key' });
+    const req = indexedDB.open('ringplayer', DB_VERSION);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      if (!d.objectStoreNames.contains('tracks')) d.createObjectStore('tracks', { keyPath: 'key' });
+      if (!d.objectStoreNames.contains('subs')) d.createObjectStore('subs', { keyPath: 'key' });
+    };
     req.onsuccess = () => { db = req.result; res(); };
     req.onerror = () => rej(req.error);
   });
+}
+function subGet(key) {
+  return new Promise(r => { if (!db) return r(null);
+    const q = db.transaction('subs', 'readonly').objectStore('subs').get(key);
+    q.onsuccess = () => r(q.result || null); q.onerror = () => r(null); });
+}
+// 写失败必须 reject：调用方要如实告诉用户"没保存"，不能报成功（QuotaExceededError 就是这条路径）
+function subPut(rec) {
+  return new Promise((res, rej) => {
+    if (!db) return rej(new Error('本地数据库未打开'));
+    let t;
+    try { t = db.transaction('subs', 'readwrite'); } catch (e) { return rej(e); }
+    t.objectStore('subs').put(rec);
+    t.oncomplete = () => res();
+    t.onerror = () => rej(t.error || new Error('写入失败'));
+    t.onabort = () => rej(t.error || new Error('写入被中止'));
+  });
+}
+function subDelete(key) {
+  return new Promise(r => { if (!db) return r();
+    const t = db.transaction('subs', 'readwrite'); t.objectStore('subs').delete(key); t.oncomplete = () => r(); t.onerror = () => r(); });
 }
 function dbPut(rec) { return new Promise(r => { const t = db.transaction('tracks', 'readwrite'); t.objectStore('tracks').put(rec); t.oncomplete = r; }); }
 function dbGetAll() { return new Promise(r => { const t = db.transaction('tracks', 'readonly'); const q = t.objectStore('tracks').getAll(); q.onsuccess = () => r(q.result || []); }); }
@@ -242,6 +298,7 @@ function paint() {
   curEl.textContent = fmt(dragging ? dragTarget : audio.currentTime * 1000);
   durEl.textContent = fmt(duration);
   seekEl.value = Math.round(f * 1000);
+  subSyncLine(dragging ? dragTarget : audio.currentTime * 1000);
 }
 function rafLoop() { paint(); rafId = requestAnimationFrame(rafLoop); }
 function startLoop() { if (!rafId) rafId = requestAnimationFrame(rafLoop); }
@@ -290,6 +347,7 @@ function selectTrack(i, autoplay) {
   titleEl.textContent = keep.name;
   playCurrent();
   renderList();
+  subOnTrackChanged();
   if (autoplay) toggle();
   else subEl.textContent = '点击中央开始播放';
 }
@@ -345,6 +403,9 @@ function renderList() {
       tracks.splice(i, 1);
       if (cur >= tracks.length) cur = tracks.length - 1;
       if (wasCur) { audio.pause(); if (cur >= 0) selectTrack(cur, false); else { cur = -1; titleEl.textContent = '环形播放器'; setPlaying(false); paint(); } }
+      // 这一句是必须的：上面 selectTrack(cur,false) 的参数就是 cur，会提前 return，不会触发
+      // subOnTrackChanged()，只有这里能清掉刚被删掉那首歌残留的字幕
+      if (wasCur) { subOnTrackChanged(); }
       renderList();
     });
     li.appendChild(nm); li.appendChild(play); li.appendChild(del);
@@ -431,10 +492,6 @@ function syncSensUI() {
   sensEl.value = secondsPerTurn;
   sensVal.textContent = Math.round(secondsPerTurn) + ' 秒';
 }
-btnSens.addEventListener('click', () => {
-  panel.hidden = !panel.hidden;
-  if (!panel.hidden) ratePanel.hidden = true;
-});
 sensReset.addEventListener('click', () => { secondsPerTurn = 30; LS.set('spt', 30); syncSensUI(); });
 sensEl.addEventListener('input', () => {
   secondsPerTurn = parseFloat(sensEl.value);
@@ -471,11 +528,337 @@ RATES.forEach(v => {
 });
 rateEl.addEventListener('input', () => applyRate(parseFloat(rateEl.value)));
 rateReset.addEventListener('click', () => applyRate(1));
-btnRate.addEventListener('click', () => {
-  ratePanel.hidden = !ratePanel.hidden;
-  if (!ratePanel.hidden) panel.hidden = true;
-});
 syncRateUI();
+
+/* ============ 字幕：生成 ============ */
+const SUB_MODELS = {
+  tiny:  { id: 'onnx-community/whisper-tiny.en',  mb: 39  },
+  base:  { id: 'onnx-community/whisper-base.en',  mb: 73  },
+  small: { id: 'onnx-community/whisper-small.en', mb: 238 },
+};
+let subModel = LS.get('subModel', 'base');
+const SUB_LANG = 'en';
+const SUB_MAX_SEC = 30 * 60;   // 超过这个时长就别解了（见 subStart 里的说明）
+const SUB_TOO_LONG_ERR = '音频太长了，一次最多转写 30 分钟，先裁短再试';
+const SUB_DECODE_ERR = '这个文件浏览器解不开（格式不支持或文件已损坏），换一首再试';
+const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
+// 带 __userFacing 的错：文案已经是可以直接给用户看的，不再走 subStart 里那套错误映射
+function subUserErr(msg) { const e = new Error(msg); e.__userFacing = true; return e; }
+
+const sub = { state: 'none', rec: null, dlPct: 0, t0: 0, totalSec: 0, err: '', warn: '' };
+let subJob = 0;            // 每次启动 +1，用来丢弃过期消息
+let subTimer = null;
+
+// 与 Task 1 探针页里验证通过的同一份源码（探针页里的 log 分支在这里不需要，故略）
+const WORKER_SRC = `
+self.onmessage = async (e) => {
+  const { audio, model, lang } = e.data;
+  try {
+    const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1');
+    env.remoteHost = 'https://hf-mirror.com';
+    env.allowLocalModels = false;
+    // device 选择（与探针页保持一致）：偏好 webgpu，回退 wasm。
+    // 实测：navigator.gpu 存在也可能拿不到 adapter（headless Chromium 即如此），而且同一 worker 里
+    // pipeline() 构建失败后**重建不会恢复**（第二次仍抛 webgpu 的错，库有记忆化），
+    // 所以必须先用 requestAdapter() 判定；下面 try/重建只作兜底。
+    let device = 'wasm';
+    try {
+      const adapter = (typeof navigator !== 'undefined' && navigator.gpu)
+        ? await navigator.gpu.requestAdapter() : null;
+      if (adapter) device = 'webgpu';
+    } catch (err) { device = 'wasm'; }
+
+    const mkPipe = (dev) => pipeline('automatic-speech-recognition', model, {
+      dtype: 'q8',
+      device: dev,
+      progress_callback: (x) => {
+        if (x.status === 'progress' && x.total)
+          self.postMessage({ type:'download', loaded: x.loaded, total: x.total });
+      },
+    });
+    let pipe;
+    try {
+      pipe = await mkPipe(device);
+    } catch (err) {
+      if (device !== 'webgpu') throw err;
+      device = 'wasm';
+      pipe = await mkPipe(device);
+    }
+
+    const asrOpts = { return_timestamps: true, chunk_length_s: 30, stride_length_s: 5 };
+    // .en 是英语专用模型，传 language/task 会被硬报错；只有多语模型才需要（见"已核实的事实"表）
+    if (!/\\.en$/.test(model)) { asrOpts.language = lang; asrOpts.task = 'transcribe'; }
+    const out = await pipe(audio, asrOpts);
+    self.postMessage({ type:'done', chunks: out.chunks || [], text: out.text || '', device });
+  } catch (err) {
+    self.postMessage({ type:'err', text: String((err && err.message) || err) });
+  }
+};
+`;
+function createAsrWorker() {
+  return new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })), { type: 'module' });
+}
+
+// 正在跑的转写 worker。取消机制只有 terminate() 一条路：只靠 subJob 递增只是丢弃结果，
+// 推理本身会一路跑完（几分钟满 CPU + 占着内存），换档重开还会同时跑两条 Whisper 管线。
+let subWorker = null;
+let subWorkerCancel = null;
+function cancelAsrJob() {
+  const c = subWorkerCancel; subWorkerCancel = null;
+  // 顺序要紧：terminate() 不发任何事件，先让 startAsrJob 里挂着的 done 落定，
+  // 否则那个 await 永不结算，subStart 的 async 帧（连同 samples 和解码后的音频）就退不掉。
+  if (c) { try { c(); } catch (e) {} }
+  if (subWorker) { try { subWorker.terminate(); } catch (e) {} subWorker = null; }
+}
+
+async function startAsrJob({ audio, model, lang, onMsg }) {
+  if (window.__asrStub) { await window.__asrStub(audio, model, onMsg); return; }
+  const w = createAsrWorker();
+  subWorker = w;
+  const done = new Promise((resolve, reject) => {
+    subWorkerCancel = () => { const e = new Error('已取消'); e.__asrCancelled = true; reject(e); };
+    w.onmessage = (e) => {
+      const d = e.data;
+      onMsg(d);
+      if (d.type === 'done') resolve();
+      else if (d.type === 'err') reject(new Error(d.text));
+    };
+    w.onerror = (e) => reject(new Error(e.message || 'worker 出错'));
+  });
+  w.postMessage({ audio, model, lang }, [audio.buffer]);
+  try { await done; }
+  finally {
+    if (subWorker === w) { subWorker = null; subWorkerCancel = null; }  // 已被取消或已被新任务接管就别再动
+    try { w.terminate(); } catch (e) {}
+  }
+}
+
+// 音频 → 16k 单声道（Task 1 已验证的实现）
+async function decodeToMono16k(blob) {
+  const ab = await blob.arrayBuffer();
+  // 这个 AudioContext 只为 decodeAudioData 存在，用完必须 close()：Safari 同时存活的
+  // AudioContext 数量上限极小，而本功能每首歌（含"重新生成"）都要跑一次，泄漏几次之后
+  // new AudioContext() 就开始抛错，字幕再也生不出来。
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    const buf = await ac.decodeAudioData(ab);
+    const off = new OfflineAudioContext(1, Math.ceil(buf.duration * 16000), 16000);
+    const src = off.createBufferSource();
+    src.buffer = buf; src.connect(off.destination); src.start();
+    const rendered = await off.startRendering();
+    return rendered.getChannelData(0).slice();
+  } finally {
+    try { ac.close(); } catch (e) {}
+  }
+}
+
+/* ============ 字幕：唤醒锁与中断 ============ */
+let wakeLock = null;
+async function subWakeOn() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+async function subWakeOff() {
+  try { if (wakeLock) { await wakeLock.release(); wakeLock = null; } } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && sub.state === 'running') subWakeOn();
+});
+
+async function subStart() {
+  const t = tracks[cur]; if (!t) return;
+  const key = t.key;
+  const job = ++subJob;
+  subClearTimer();
+  cancelAsrJob();     // 保证任何时刻只有一条 Whisper 管线在跑（上一轮没跑完就先掐掉）
+  sub.state = 'running'; sub.err = ''; sub.warn = ''; sub.dlPct = 0; sub.t0 = Date.now();
+  subWakeOn();
+  sub.totalSec = (audio.duration || 0) || 0;
+  renderSubPanel();
+  subTimer = setInterval(() => { if (sub.state === 'running') renderSubPanel(); }, 1000);
+  try {
+    if (!t.url) t.url = URL.createObjectURL(t.blob);
+    // 超长音频在解码前就挡掉：decodeAudioData 要把整段解成原始采样率的 float32
+    // （1 小时立体声 ≈1.3GB），Safari 上必然在解码里失败，且那条失败信息无法与"文件解不开"区分。
+    if (isFinite(audio.duration) && audio.duration > SUB_MAX_SEC) throw subUserErr(SUB_TOO_LONG_ERR);
+    let samples;
+    try {
+      samples = await decodeToMono16k(t.blob);
+    } catch (e) {
+      // 解码要单独给文案：此刻 dlPct 还是 0，而浏览器的解码报错（"Failed to execute..."）会被
+      // 下面的下载失败正则吃掉，让用户对着一个永远解不开的文件去查网络、反复点重试。
+      throw subUserErr(SUB_DECODE_ERR);
+    }
+    if (job !== subJob) return;
+    sub.totalSec = samples.length / 16000;
+    renderSubPanel();
+    let chunks = null;
+    await startAsrJob({
+      audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG,
+      onMsg: (d) => {
+        if (job !== subJob) return;
+        if (d.type === 'download') { sub.dlPct = d.total ? d.loaded / d.total : 0; renderSubPanel(); }
+        else if (d.type === 'done') { chunks = d.chunks; }
+      },
+    });
+    if (job !== subJob) return;
+    // 库返回 chunks[].timestamp = [起, 止]；末段可能给 [起, null]，缺结束时间时用音频总时长兜底
+    const chunksOut = (chunks || []).map(c => {
+      const ts = c.timestamp || [];
+      const s = c.s !== undefined ? c.s : (ts[0] || 0);
+      let e = c.e !== undefined ? c.e : (ts[1] != null ? ts[1] : null);
+      if (e == null || e < s) e = Math.max(s, sub.totalSec);
+      return { s, e, text: (c.text || '').trim() };
+    }).filter(c => c.text);
+    const rec = { key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
+                  durationSec: sub.totalSec, chunks: chunksOut };
+    sub.rec = rec; sub.state = rec.chunks.length ? 'done' : 'error';
+    if (!rec.chunks.length) sub.err = '这段音频没识别出任何句子';
+    else {
+      try { await subPut(rec); }
+      catch (e) {
+        // 落库失败（QuotaExceededError 等）不能报成功：文稿只在内存里，重开页面就没了。
+        // 状态仍是 done（文稿确实生成了，导出、跟读都能用），只是状态行如实带一句警告。
+        if (job !== subJob) return;
+        sub.warn = SUB_SAVE_WARN;
+      }
+    }
+  } catch (e) {
+    if (e && e.__asrCancelled) return;   // 停止/切歌造成的取消：静默收场，绝不当错误抛给用户
+    if (job !== subJob) return;
+    const msg = String((e && e.message) || e);
+    if (e && e.__userFacing) sub.err = msg;   // 解码失败/超长：文案已经是给用户看的，不再映射
+    else if (/memory|allocation|RangeError/i.test(msg)) sub.err = '内存不足：改用 base 或 tiny 档再试';
+    else if (sub.dlPct < 1 && /fetch|network|HTTP|Failed/i.test(msg)) sub.err = '模型下载失败（检查网络/镜像），点重试';
+    else sub.err = '转写失败：' + msg;
+    sub.state = 'error';
+    subWakeOff();
+  }
+  subClearTimer();
+  renderSubPanel();
+  renderSubList();
+  subSyncLine(audio.currentTime * 1000, true);
+  subWakeOff();
+}
+
+function subStop() { subJob++; cancelAsrJob(); subClearTimer(); subWakeOff(); sub.state = sub.rec ? 'done' : 'ready'; renderSubPanel(); }
+function subClearTimer() { if (subTimer) { clearInterval(subTimer); subTimer = null; } }
+
+/* ============ 字幕：同步 ============ */
+let subIdx = -1;
+function subSyncLine(ms, force) {
+  const cs = sub.rec && sub.rec.chunks;
+  if (!cs) {
+    if (subIdx !== -1 || force) { subIdx = -1; subLineEl.textContent = ''; subLineEl.classList.remove('on'); }
+    return;
+  }
+  const t = ms / 1000;
+  let i = subIdx;
+  if (i < 0 || i >= cs.length || t < cs[i].s) {          // 回退或跳转：二分
+    let lo = 0, hi = cs.length - 1, found = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1;
+      if (cs[m].s <= t) { found = m; lo = m + 1; } else hi = m - 1; }
+    i = found;
+  } else {
+    while (i + 1 < cs.length && t >= cs[i + 1].s) i++;    // 前进：只往前挪
+  }
+  if (i === subIdx && !force) return;
+  subIdx = i;
+  const c = cs[i];
+  subLineEl.textContent = c ? c.text : '';
+  subLineEl.classList.toggle('on', !!c);
+  const rows = subListEl.children;
+  for (let k = 0; k < rows.length; k++) rows[k].classList.toggle('on', k === i);
+  if (i >= 0 && rows[i] && rows[i].scrollIntoView) rows[i].scrollIntoView({ block: 'nearest' });
+}
+
+/* ============ 字幕：面板 ============ */
+const subPanel = A('subPanel'), subListEl = A('subList'), subLineEl = A('subline');
+function showPanel(name) {
+  panel.hidden = name !== 'sens';
+  ratePanel.hidden = name !== 'rate';
+  subPanel.hidden = name !== 'sub';
+}
+function renderSubPanel() {
+  const st = A('subStatus'), start = A('subStart'), stop = A('subStop'), del = A('subDel');
+  const running = sub.state === 'running';
+  start.hidden = running || sub.state === 'done' || !tracks[cur];
+  stop.hidden = !running;
+  del.hidden = !sub.rec || running;
+  A('subModelRow').hidden = !!sub.rec;
+  A('subExportRow').hidden = sub.state !== 'done';
+  A('subModel').value = subModel;
+  start.textContent = sub.state === 'error' ? '重新生成' : '生成字幕';
+  if (!tracks[cur]) st.textContent = '先选一首歌，再生成字幕';
+  else if (sub.state === 'none') st.textContent = '字幕';
+  else if (sub.state === 'ready') st.textContent = '生成字幕（英文 · 首次下载约 ' + SUB_MODELS[subModel].mb + 'MB）';
+  else if (sub.state === 'running') st.textContent = sub.dlPct < 1
+      ? '下载模型中 ' + Math.round(sub.dlPct * 100) + '%'
+      : '转写中 ' + Math.round((Date.now() - sub.t0) / 1000) + 's（音频 '
+        + Math.round(sub.totalSec) + 's，请保持屏幕常亮）';
+  else if (sub.state === 'done') st.textContent = '字幕已生成（' + sub.rec.chunks.length + ' 句）'
+      + (sub.warn ? '，但' + sub.warn : '');
+  else st.textContent = sub.err || '失败';
+}
+function renderSubList() {
+  subListEl.innerHTML = '';
+  if (!sub.rec) return;
+  sub.rec.chunks.forEach((c, i) => {
+    const d = document.createElement('div');
+    d.className = 'row'; d.dataset.i = i; d.textContent = c.text;
+    d.addEventListener('click', () => { audio.currentTime = c.s; paint(); });
+    subListEl.appendChild(d);
+  });
+}
+function subOnTrackChanged() {
+  subJob++;
+  cancelAsrJob();    // 切歌必须真的掐掉推理：只递增 subJob 只是丢结果，worker 会继续跑满 CPU
+  subClearTimer();   // subStart 里 job!==subJob 的提前 return 会跳过 subClearTimer()，换歌/删歌时在这里统一收掉 1s 定时器
+  subWakeOff();      // 同理：换歌会让 subStart 提前 return 跳过尾部 subWakeOff()，这里收掉转写期间的唤醒锁
+  sub.state = 'none'; sub.rec = null; sub.err = ''; sub.dlPct = 0; sub.warn = '';
+  subLineEl.textContent = ''; subLineEl.classList.remove('on');
+  renderSubList(); renderSubPanel();
+  const k = curKey(); if (!k) return;
+  subGet(k).then(r => {
+    if (r && r.chunks && r.chunks.length) { sub.rec = r; sub.state = 'done'; }
+    else sub.state = 'ready';
+    renderSubPanel(); renderSubList();
+    subSyncLine(audio.currentTime * 1000, true);
+  });
+}
+
+/* ============ 字幕：接线 ============ */
+btnSens.addEventListener('click', () => showPanel(panel.hidden ? 'sens' : null));
+btnRate.addEventListener('click', () => showPanel(ratePanel.hidden ? 'rate' : null));
+A('btnSub').addEventListener('click', () => showPanel(subPanel.hidden ? 'sub' : null));
+A('subStart').addEventListener('click', subStart);
+A('subStop').addEventListener('click', subStop);
+A('subDel').addEventListener('click', async () => {
+  const k = curKey(); if (k) await subDelete(k);
+  sub.rec = null; sub.state = 'ready'; renderSubList(); renderSubPanel(); subSyncLine(0, true);
+});
+A('subModel').addEventListener('change', () => { subModel = A('subModel').value; LS.set('subModel', subModel); renderSubPanel(); });
+
+/* ============ 字幕：导出 ============ */
+function srtTime(sec) {
+  const ms = Math.max(0, Math.round(sec * 1000));
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return p(Math.floor(ms / 3600000)) + ':' + p(Math.floor(ms / 60000) % 60) + ':'
+       + p(Math.floor(ms / 1000) % 60) + ',' + p(ms % 1000, 3);
+}
+function subExport(fmt) {
+  if (!sub.rec) return;
+  const name = (tracks[cur] && tracks[cur].name || 'subtitle').replace(/\.[^.]+$/, '');
+  const body = fmt === 'srt'
+    ? sub.rec.chunks.map((c, i) => (i + 1) + '\n' + srtTime(c.s) + ' --> ' + srtTime(c.e) + '\n' + c.text).join('\n\n') + '\n'
+    : sub.rec.chunks.map(c => c.text).join('\n') + '\n';
+  const url = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name + '.' + fmt;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+A('subSrt').addEventListener('click', () => subExport('srt'));
+A('subTxt').addEventListener('click', () => subExport('txt'));
 
 /* ============ 启动 ============ */
 var jsOk = document.getElementById('jsok');
@@ -492,6 +875,8 @@ if ('serviceWorker' in navigator &&
     (location.protocol === 'https:' || location.hostname === 'localhost')) {
   navigator.serviceWorker.register('sw.js').catch(function () { /* 忽略 */ });
 }
+
+renderSubPanel();   // 首屏就按当前状态渲染（无曲目时提示先选歌；有曲目时 loadStored→subOnTrackChanged 会再渲染一次）
 </script>
 </body>
 </html>

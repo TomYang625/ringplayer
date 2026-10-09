@@ -28,6 +28,8 @@ self.addEventListener('fetch', (e) => {
     );
     return;
   }
+  // 模型文件交给 transformers.js 自己的 Cache API 管；SW 再存一份会让模型占双倍空间
+  if (req.url.includes('hf-mirror.com')) return;
   e.respondWith(
     caches.match(req).then((hit) => {
       if (hit) return hit;
