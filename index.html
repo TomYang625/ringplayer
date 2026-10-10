@@ -61,10 +61,10 @@
   #list li button{flex:none;border:0;background:transparent;color:var(--sub);font-size:13px;padding:2px 6px;border-radius:6px}
   #list li button:hover{background:var(--surface2)}
   #fileInput{display:none}
-  #subline{display:none;text-align:center;font-size:14px;color:var(--accent);margin:6px 2px 0;overflow:hidden;min-height:0}
+  #subline{display:none;text-align:center;font-size:18px;line-height:1.35;color:var(--accent);margin:8px 2px 0;overflow:hidden;min-height:0}
   #subline.on{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-  #subList{max-height:30vh;overflow-y:auto;margin-top:6px;font-size:14px}
-  #subList .row{padding:5px 6px;border-radius:8px;cursor:pointer;color:var(--sub)}
+  #subList{max-height:30vh;overflow-y:auto;margin-top:6px;font-size:16px}
+  #subList .row{padding:7px 8px;border-radius:8px;cursor:pointer;color:var(--sub)}
   #subList .row.on{background:var(--surface2);color:var(--txt);font-weight:600}
 </style>
 </head>
@@ -334,6 +334,7 @@ function playCurrent() {
     audio.playbackRate = rate;
     if (pos > 0 && pos < duration) { try { audio.currentTime = pos / 1000; } catch (e) {} }
     subEl.textContent = '已就绪';
+    renderSubPanel();   // 元数据到了，刷新面板（"这段约需多久"要靠时长才算得出来）
   };
   audio.onerror = () => setErr('无法播放该文件');
   audio.ontimeupdate = () => {
@@ -543,9 +544,10 @@ const SUB_MODELS = {
   base:  { id: 'onnx-community/whisper-base.en',  mb: 73  },
   small: { id: 'onnx-community/whisper-small.en', mb: 238 },
 };
-// 默认 tiny.en：实测 base.en 在真机上等 7 分钟仍无结果（而 tiny.en 是它的约 1/4 体积、快得多）。
-// 要更准可在面板里改档；一旦选定会记在 localStorage 里，不会每次被改回。
-let subModel = LS.get('subModel', 'tiny');
+// 默认 base.en：真机实测（iPad mini 5 / wasm）处理 60 秒音频约 60 秒 ≈ 1 倍实时，可以接受，
+// 而它的英文准确度明显好于 tiny.en。要更快可在面板里改 tiny.en（约 2–3 倍实时）；
+// 选定后会记在 localStorage 里，不会被改回。
+let subModel = LS.get('subModel', 'base');
 
 /* 崩溃不留痕迹：把"跑到哪一步、用的哪个后端"随时写进 localStorage，成功/报错时清掉。
    页面若被浏览器干掉，这条记录就会留下——下次打开据此判断并自动改走更稳的路。 */
@@ -560,7 +562,9 @@ const SUB_MAX_SEC = 30 * 60;   // 超过这个时长就别解了（见 subStart 
 // 分段转写的段长（秒）。段越短：进度越细、崩溃损失越小，但段间接缝越多（接缝处可能丢一个词）。
 // 取 120 秒：一段之内 whisper 自己还会按 30 秒开窗，接缝数量对常见长度来说已经很少。
 const SUB_SEG_SEC = 120;
-const SUB_TOO_LONG_ERR = '音频太长了，一次最多转写 30 分钟，先裁短再试';
+const SUB_TOO_LONG_ERR = '音频太长了：一次最多转写 30 分钟（更长的文件光解码就要占掉大量内存，iPad 上会崩），先裁短再试';
+// 本机实测倍速（音频秒数 ÷ 转写秒数），按模型档分别记。第一次跑完后就有了，用来预估"这段要等多久"。
+const SUB_LS_SPEED = 'subSpeed';
 const SUB_DECODE_ERR = '这个文件浏览器解不开（格式不支持或文件已损坏），换一首再试';
 const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
 // 带 __userFacing 的错：文案已经是可以直接给用户看的，不再走 subStart 里那套错误映射
@@ -849,6 +853,7 @@ async function subStart() {
           renderSubPanel();
         } else if (d.type === 'ready') {
           sub.phase = 'transcribe'; sub.device = d.device || '';
+          sub.tTrans = Date.now();    // 记下转写起点，跑完据此换算本机倍速
           subRunMark('transcribe');   // 崩溃多发生在这一步，落地留痕（含后端）
           renderSubPanel();
         } else if (d.type === 'seg') {
@@ -918,6 +923,16 @@ async function subStart() {
     sub.state = 'error';
     subWakeOff();
   }
+  // 记下本机这次的实际速度（音频秒 ÷ 转写秒），下次生成前就能预估要等多久
+  if (sub.tTrans && sub.totalSec > 0) {
+    const secs = (Date.now() - sub.tTrans) / 1000;
+    const rate = secs > 0.5 ? sub.totalSec / secs : 0;
+    if (isFinite(rate) && rate > 0) {
+      const sp = LS.get(SUB_LS_SPEED, {}) || {};
+      sp[SUB_MODELS[subModel].id] = rate;
+      LS.set(SUB_LS_SPEED, sp);
+    }
+  }
   subClearTimer();
   subRunClear();     // 正常跑完（或已知错误）→ 清掉"中断留痕"，免得下次误判为崩溃
   renderSubPanel();
@@ -963,6 +978,7 @@ function showPanel(name) {
   panel.hidden = name !== 'sens';
   ratePanel.hidden = name !== 'rate';
   subPanel.hidden = name !== 'sub';
+  renderSubPanel();   // 打开面板正是用户读那行字的时候；顺带刷新"预计要等多久"（它依赖音频元数据）
 }
 function renderSubPanel() {
   const st = A('subStatus'), start = A('subStart'), stop = A('subStop'), del = A('subDel');
@@ -976,7 +992,13 @@ function renderSubPanel() {
   start.textContent = sub.state === 'error' ? '重新生成' : '生成字幕';
   if (!tracks[cur]) st.textContent = '先选一首歌，再生成字幕';
   else if (sub.state === 'none') st.textContent = '字幕';
-  else if (sub.state === 'ready') st.textContent = '生成字幕（英文 · 首次下载约 ' + SUB_MODELS[subModel].mb + 'MB）';
+  else if (sub.state === 'ready') {
+    // 有实测倍速就预估耗时：让用户点之前就知道要等多久，而不是点完干等
+    const rate = (LS.get(SUB_LS_SPEED, {}) || {})[SUB_MODELS[subModel].id];
+    const dur = isFinite(audio.duration) ? audio.duration : 0;
+    const est = (rate && dur) ? '，本机约 ' + rate.toFixed(1) + ' 倍速，这段约需 ' + fmtElapsed(dur / rate) : '';
+    st.textContent = '生成字幕（英文 · 首次下载约 ' + SUB_MODELS[subModel].mb + 'MB）' + est;
+  }
   else if (sub.state === 'running') {
     // 三个阶段都带上"已用时长"：实时可见，用户就不必猜它是不是卡住了
     const el = fmtElapsed((Date.now() - sub.t0) / 1000);
