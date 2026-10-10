@@ -546,8 +546,20 @@ const SUB_MODELS = {
 // 默认 tiny.en：实测 base.en 在真机上等 7 分钟仍无结果（而 tiny.en 是它的约 1/4 体积、快得多）。
 // 要更准可在面板里改档；一旦选定会记在 localStorage 里，不会每次被改回。
 let subModel = LS.get('subModel', 'tiny');
+
+/* 崩溃不留痕迹：把"跑到哪一步、用的哪个后端"随时写进 localStorage，成功/报错时清掉。
+   页面若被浏览器干掉，这条记录就会留下——下次打开据此判断并自动改走更稳的路。 */
+const SUB_LS_RUN = 'subLastRun';
+function subRunMark(stage) {
+  try { LS.set(SUB_LS_RUN, { stage, device: sub.device || '', model: subModel,
+        audioSec: Math.round(sub.totalSec), at: Date.now() }); } catch (e) {}
+}
+function subRunClear() { try { localStorage.removeItem(SUB_LS_RUN); } catch (e) {} }
 const SUB_LANG = 'en';
 const SUB_MAX_SEC = 30 * 60;   // 超过这个时长就别解了（见 subStart 里的说明）
+// 分段转写的段长（秒）。段越短：进度越细、崩溃损失越小，但段间接缝越多（接缝处可能丢一个词）。
+// 取 120 秒：一段之内 whisper 自己还会按 30 秒开窗，接缝数量对常见长度来说已经很少。
+const SUB_SEG_SEC = 120;
 const SUB_TOO_LONG_ERR = '音频太长了，一次最多转写 30 分钟，先裁短再试';
 const SUB_DECODE_ERR = '这个文件浏览器解不开（格式不支持或文件已损坏），换一首再试';
 const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
@@ -562,7 +574,7 @@ let subTimer = null;
 // 与 Task 1 探针页里验证通过的同一份源码（探针页里的 log 分支在这里不需要，故略）
 const WORKER_SRC = `
 self.onmessage = async (e) => {
-  const { audio, model, lang } = e.data;
+  const { audio, model, lang, avoidWebgpu, startSeg } = e.data;
   try {
     // 先报一声"我起来了"：万一浏览器不支持这种内联 Worker / 外部模块加载，
     // 界面就能看出卡在哪一步，而不是只看到"已用 Xs"永远不动。
@@ -582,8 +594,10 @@ self.onmessage = async (e) => {
     // pipeline() 构建失败后**重建不会恢复**（第二次仍抛 webgpu 的错，库有记忆化），
     // 所以必须先用 requestAdapter() 判定；下面 try/重建只作兜底。
     let device = 'wasm';
+    // avoidWebgpu：上一次生成疑似在 GPU 路径上把页面搞崩了（主线程记在 localStorage 里），
+    // 这次直接走 wasm，别再赌一次。
     try {
-      const adapter = (typeof navigator !== 'undefined' && navigator.gpu)
+      const adapter = (!avoidWebgpu && typeof navigator !== 'undefined' && navigator.gpu)
         ? await navigator.gpu.requestAdapter() : null;
       if (adapter) device = 'webgpu';
     } catch (err) { device = 'wasm'; }
@@ -616,8 +630,29 @@ self.onmessage = async (e) => {
     };
     // .en 是英语专用模型，传 language/task 会被硬报错；只有多语模型才需要（见"已核实的事实"表）
     if (!/\\.en$/.test(model)) { asrOpts.language = lang; asrOpts.task = 'transcribe'; }
-    const out = await pipe(audio, asrOpts);
-    self.postMessage({ type:'done', chunks: out.chunks || [], text: out.text || '', device });
+    // 分段转写（每段 ${SUB_SEG_SEC} 秒）：
+    //  ① 能给出**真实进度**（"已转写 2/5 段"），而不是只报个计时；
+    //  ② 每段结果立刻回传，主线程随即落盘 —— 页面万一被系统干掉，重开可以从已完成的那段接着转，
+    //     而不是每次从头再来（这是"崩溃白跑"的实际解法）；
+    //  ③ 段边界不设重叠，代价是每段接缝处可能丢一个词；段取 ${SUB_SEG_SEC} 秒就是为了让接缝尽量少。
+    const segLen = 16000 * ${SUB_SEG_SEC};
+    const nSeg = Math.max(1, Math.ceil(audio.length / segLen));
+    const from = Math.max(0, Math.min(startSeg | 0, nSeg - 1));
+    let all = [], text = '';
+    for (let i = from; i < nSeg; i++) {
+      const seg = audio.subarray(i * segLen, Math.min((i + 1) * segLen, audio.length));
+      const out = await pipe(seg, asrOpts);
+      const base = i * ${SUB_SEG_SEC};
+      const part = (out.chunks || []).map(c => {
+        const ts = c.timestamp || [];
+        return { timestamp: [ts[0] == null ? null : ts[0] + base, ts[1] == null ? null : ts[1] + base],
+                 text: c.text };
+      });
+      all = all.concat(part);
+      text += (text ? ' ' : '') + (out.text || '');
+      self.postMessage({ type:'seg', i: i, n: nSeg, chunks: part, device: device });
+    }
+    self.postMessage({ type:'done', chunks: all, text: text, device: device });
   } catch (err) {
     self.postMessage({ type:'err', text: String((err && err.message) || err) });
   }
@@ -639,7 +674,7 @@ function cancelAsrJob() {
   if (subWorker) { try { subWorker.terminate(); } catch (e) {} subWorker = null; }
 }
 
-async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module' }) {
+async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module', startSeg = 0 }) {
   if (window.__asrStub) { await window.__asrStub(audio, model, onMsg); return; }
   let w;
   try { w = createAsrWorker(workerType); }
@@ -668,7 +703,8 @@ async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module' })
       reject(err);
     };
   });
-  w.postMessage({ audio, model, lang }, [audio.buffer]);
+  w.postMessage({ audio, model, lang, startSeg: startSeg,
+                  avoidWebgpu: !!LS.get('subAvoidWebgpu', false) }, [audio.buffer]);
   try { await done; }
   finally {
     if (subWorker === w) { subWorker = null; subWorkerCancel = null; }  // 已被取消或已被新任务接管就别再动
@@ -766,7 +802,7 @@ async function subStart() {
   cancelAsrJob();     // 保证任何时刻只有一条 Whisper 管线在跑（上一轮没跑完就先掐掉）
   sub.state = 'running'; sub.err = ''; sub.warn = ''; sub.t0 = Date.now();
   sub.phase = 'decode'; sub.dlPct = 0; sub.dlLoaded = 0; sub.dlTotal = 0; sub.device = '';
-  sub.booted = false; sub.lastAt = Date.now();
+  sub.booted = false; sub.lastAt = Date.now(); sub.crash = ''; sub.segDone = 0; sub.segTotal = 0;
   subWakeOn();
   sub.totalSec = (audio.duration || 0) || 0;
   renderSubPanel();
@@ -788,11 +824,21 @@ async function subStart() {
     }
     if (job !== subJob) return;
     sub.totalSec = samples.length / 16000;
+    // 上一次若在同一首歌上中断过（partial 记录），把已完成的分段读回来，从那里接着转，不重复劳动。
+    let chunks = [], doneSeg = 0;
+    const prev = await subGet(key);
+    if (job !== subJob) return;
+    if (prev && prev.partial && prev.doneSeg > 0 && prev.model === SUB_MODELS[subModel].id) {
+      chunks = prev.chunks || [];
+      doneSeg = prev.doneSeg;
+    }
+    sub.segDone = doneSeg;
+    sub.segTotal = Math.max(1, Math.ceil(sub.totalSec / SUB_SEG_SEC));
     sub.phase = 'prep';                 // 解码完毕 → 接下来是下载/加载模型
+    subRunMark('prep');
     renderSubPanel();
-    let chunks = null;
     const runJob = (workerType) => startAsrJob({
-      audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG, workerType,
+      audio: samples, model: SUB_MODELS[subModel].id, lang: SUB_LANG, workerType, startSeg: doneSeg,
       onMsg: (d) => {
         if (job !== subJob) return;
         sub.lastAt = Date.now();
@@ -802,8 +848,18 @@ async function subStart() {
           sub.dlPct = d.total ? d.loaded / d.total : 0;
           renderSubPanel();
         } else if (d.type === 'ready') {
-          sub.phase = 'transcribe'; sub.device = d.device || ''; renderSubPanel();
-        } else if (d.type === 'done') { chunks = d.chunks; }
+          sub.phase = 'transcribe'; sub.device = d.device || '';
+          subRunMark('transcribe');   // 崩溃多发生在这一步，落地留痕（含后端）
+          renderSubPanel();
+        } else if (d.type === 'seg') {
+          // 一段转完就落盘：页面若在这之后被系统干掉，下次可从这一段接着转。
+          chunks = chunks.concat(d.chunks || []);
+          sub.segDone = d.i + 1; sub.device = d.device || sub.device;
+          subRunMark('transcribe');
+          subPut({ key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
+                   durationSec: sub.totalSec, chunks: chunks, doneSeg: sub.segDone, partial: true });
+          renderSubPanel();
+        } else if (d.type === 'done') { if (d.chunks && d.chunks.length) chunks = d.chunks; }
       },
     });
     try {
@@ -830,7 +886,8 @@ async function subStart() {
       return { s, e, text: (c.text || '').trim() };
     }).filter(c => c.text);
     const rec = { key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
-                  durationSec: sub.totalSec, chunks: chunksOut };
+                  durationSec: sub.totalSec, chunks: chunksOut,
+                  doneSeg: sub.segTotal, partial: false };
     sub.rec = rec; sub.state = rec.chunks.length ? 'done' : 'error';
     if (!rec.chunks.length) sub.err = '这段音频没识别出任何句子';
     else {
@@ -857,13 +914,14 @@ async function subStart() {
     subWakeOff();
   }
   subClearTimer();
+  subRunClear();     // 正常跑完（或已知错误）→ 清掉"中断留痕"，免得下次误判为崩溃
   renderSubPanel();
   renderSubList();
   subSyncLine(audio.currentTime * 1000, true);
   subWakeOff();
 }
 
-function subStop() { subJob++; cancelAsrJob(); subClearTimer(); subWakeOff(); sub.state = sub.rec ? 'done' : 'ready'; renderSubPanel(); }
+function subStop() { subJob++; cancelAsrJob(); subClearTimer(); subWakeOff(); subRunClear(); sub.state = sub.rec ? 'done' : 'ready'; renderSubPanel(); }
 function subClearTimer() { if (subTimer) { clearInterval(subTimer); subTimer = null; } }
 
 /* ============ 字幕：同步 ============ */
@@ -918,7 +976,9 @@ function renderSubPanel() {
     // 三个阶段都带上"已用时长"：实时可见，用户就不必猜它是不是卡住了
     const el = fmtElapsed((Date.now() - sub.t0) / 1000);
     if (sub.phase === 'transcribe') {
-      st.textContent = '转写中…（已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's，请保持屏幕常亮）'
+      const segTxt = sub.segTotal > 1 ? '已转写 ' + sub.segDone + '/' + sub.segTotal + ' 段，' : '';
+      st.textContent = '转写中…（' + segTxt + '已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's'
+        + (sub.device ? '，' + sub.device : '') + '，请保持屏幕常亮）'
         // 阈值取 2 分钟：实测 token 回调在 ASR 上是"随内容密度"触发的（近乎静音时很少），
         // 阈值太激进会在正常但缓慢的转写里误报"进程已被回收"。
         + (Date.now() - sub.lastAt > 120000
@@ -947,6 +1007,8 @@ function renderSubPanel() {
   else if (sub.state === 'done') st.textContent = '字幕已生成（' + sub.rec.chunks.length + ' 句'
       + (sub.device ? ' · ' + sub.device : '') + '）' + (sub.warn ? '，但' + sub.warn : '');
   else st.textContent = sub.err || '失败';
+  // 「上次生成在哪一步中断」的提示：挂在任何状态后面显示，直到用户再点一次生成
+  if (sub.crash) st.textContent += ' · ' + sub.crash;
 }
 function fmtElapsed(sec) {
   const s = Math.max(0, Math.round(sec));
@@ -969,12 +1031,19 @@ function subOnTrackChanged() {
   cancelAsrJob();    // 切歌必须真的掐掉推理：只递增 subJob 只是丢结果，worker 会继续跑满 CPU
   subClearTimer();   // subStart 里 job!==subJob 的提前 return 会跳过 subClearTimer()，换歌/删歌时在这里统一收掉 1s 定时器
   subWakeOff();      // 同理：换歌会让 subStart 提前 return 跳过尾部 subWakeOff()，这里收掉转写期间的唤醒锁
+  subRunClear();     // 换歌是主动取消，不是崩溃，别把留痕留给下次启动
   sub.state = 'none'; sub.rec = null; sub.err = ''; sub.dlPct = 0; sub.warn = '';
   subLineEl.textContent = ''; subLineEl.classList.remove('on');
   renderSubList(); renderSubPanel();
   const k = curKey(); if (!k) return;
   subGet(k).then(r => {
-    if (r && r.chunks && r.chunks.length) { sub.rec = r; sub.state = 'done'; }
+    if (r && r.partial && r.doneSeg > 0) {
+      // 上次转到一半被打断：先把已有的显示出来，并说明"再点一次生成会接着转"
+      sub.rec = r; sub.state = 'ready';
+      sub.crash = '上次转到 ' + r.doneSeg + '/'
+                + Math.max(1, Math.ceil((r.durationSec || 0) / SUB_SEG_SEC)) + ' 段中断，'
+                + '再点一次「生成字幕」会接着转';
+    } else if (r && r.chunks && r.chunks.length) { sub.rec = r; sub.state = 'done'; }
     else sub.state = 'ready';
     renderSubPanel(); renderSubList();
     subSyncLine(audio.currentTime * 1000, true);
@@ -1034,6 +1103,23 @@ if ('serviceWorker' in navigator &&
 }
 
 renderSubPanel();   // 首屏就按当前状态渲染（无曲目时提示先选歌；有曲目时 loadStored→subOnTrackChanged 会再渲染一次）
+
+// 上次生成若在「准备模型/转写中」阶段留下了记录却没有被清掉，说明页面是在那时被浏览器干掉的
+// （崩溃不留任何痕迹，所以只能靠这条记录）。据此给出说明，并在疑似 GPU 路径上自动改走 wasm。
+(function interpretLastRun() {
+  const last = LS.get(SUB_LS_RUN, null);
+  if (!last || sub.state === 'running') return;
+  subRunClear();
+  let extra = '';
+  if (last.stage === 'transcribe' && last.device === 'webgpu' && !LS.get('subAvoidWebgpu', false)) {
+    LS.set('subAvoidWebgpu', true);      // GPU 路径疑似把页面搞崩过 → 以后直接走 wasm，不再赌
+    extra = '——已自动改用更稳的 wasm 方式';
+  }
+  sub.crash = '上次生成中断在「' + (last.stage === 'transcribe' ? '转写中' : '准备模型') + '」阶段'
+            + (last.device ? '（' + last.device + (last.model ? '，' + last.model : '') + '）' : '')
+            + extra + '，请再点一次生成';
+  renderSubPanel();
+})();
 </script>
 </body>
 </html>
