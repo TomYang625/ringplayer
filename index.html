@@ -677,22 +677,63 @@ async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module' })
 }
 
 // 音频 → 16k 单声道（Task 1 已验证的实现）
+// 复用一个 AudioContext，而且**首次创建必须发生在用户手势任务内**（subStart 里第一件事就调它）：
+// iOS 上在 await 之后再创建，上下文会以 suspended 状态出现，decodeAudioData 随之失败——
+// 这正是"点生成后报格式不支持"最常见的原因。复用还顺带解决了 Safari 对同时存活数量的硬限。
+// 请求 16000Hz：decodeAudioData 会直接按该采样率解码，省掉一次 OfflineAudioContext 重采样，
+// 中间缓冲也只有原生采样率的约 1/3（长音频在 iPad 上最容易失败的就是这一步的内存）。
+// 判定"这台设备的 WebKit 太老，做不了离线识别"。
+// 依据：iPadOS 13+ 的 Safari 用桌面式 UA，UA 里没有 "OS 14_"，但 Version/ 与系统大版本基本同步；
+// iPad 上的 Chrome/Firefox 也跑 WebKit，UA 里带 "OS 14_4" 之类，同样能识别。
+// 判错只影响"要不要直接给提示"：判成旧设备 = 不尝试 Worker（不崩）；判成新设备 = 照常尝试（可能失败但有兜底）。
+function asrUnsupportedOS() {
+  const ua = navigator.userAgent || '';
+  if (!/AppleWebKit/.test(ua)) return false;                 // 非 WebKit（桌面 Chrome 等）不受此限
+  const os = /OS (\d+)[_.]/.exec(ua);
+  const ver = /Version\/(\d+)/.exec(ua);
+  const osMajor = os ? +os[1] : 0;
+  const safariMajor = ver ? +ver[1] : 0;
+  return (osMajor > 0 && osMajor < 15) || (safariMajor > 0 && safariMajor < 15);
+}
+
+let decodeCtx = null;
+function getDecodeCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!decodeCtx) decodeCtx = new AC({ sampleRate: 16000 });
+  if (decodeCtx.state === 'suspended' && decodeCtx.resume) decodeCtx.resume().catch(() => {});
+  return decodeCtx;
+}
+
 async function decodeToMono16k(blob) {
   const ab = await blob.arrayBuffer();
-  // 这个 AudioContext 只为 decodeAudioData 存在，用完必须 close()：Safari 同时存活的
-  // AudioContext 数量上限极小，而本功能每首歌（含"重新生成"）都要跑一次，泄漏几次之后
-  // new AudioContext() 就开始抛错，字幕再也生不出来。
-  const ac = new (window.AudioContext || window.webkitAudioContext)();
-  try {
-    const buf = await ac.decodeAudioData(ab);
-    const off = new OfflineAudioContext(1, Math.ceil(buf.duration * 16000), 16000);
-    const src = off.createBufferSource();
-    src.buffer = buf; src.connect(off.destination); src.start();
-    const rendered = await off.startRendering();
-    return rendered.getChannelData(0).slice();
-  } finally {
-    try { ac.close(); } catch (e) {}
+  // iOS 上从 iCloud/「文件」里选中的音频如果还没下载到本机：<audio> 能边下边播，
+  // 但读字节会拿到空数据，decodeAudioData 随即报"格式不支持"——文案会把人带偏。
+  if (!ab.byteLength) {
+    throw subUserErr('读到的文件是空的（0 字节，共 ' + (blob.size / 1048576).toFixed(1) + 'MB）：'
+      + '若这首歌在 iCloud 或「文件」里还没下载到本机，请先在「文件」App 里把它下载下来再试');
   }
+  const ac = getDecodeCtx();
+  const buf = await ac.decodeAudioData(ab);
+  const n = Math.ceil(buf.duration * 16000);
+  if (buf.sampleRate === 16000) {            // 常规路径：已是 16kHz，只需降为单声道
+    const out = new Float32Array(n);
+    if (buf.numberOfChannels === 1) {
+      out.set(buf.getChannelData(0).subarray(0, n));
+    } else {
+      for (let c = 0; c < buf.numberOfChannels; c++) {
+        const d = buf.getChannelData(c);
+        for (let i = 0; i < n; i++) out[i] += d[i];
+      }
+      for (let i = 0; i < n; i++) out[i] /= buf.numberOfChannels;
+    }
+    return out;
+  }
+  // 老浏览器会忽略 sampleRate 选项 → 退回 OfflineAudioContext 重采样（顺带降为单声道）
+  const off = new OfflineAudioContext(1, n, 16000);
+  const src = off.createBufferSource();
+  src.buffer = buf; src.connect(off.destination); src.start();
+  const rendered = await off.startRendering();
+  return rendered.getChannelData(0).slice();
 }
 
 /* ============ 字幕：唤醒锁与中断 ============ */
@@ -709,6 +750,16 @@ document.addEventListener('visibilitychange', () => {
 
 async function subStart() {
   const t = tracks[cur]; if (!t) return;
+  // iPadOS 14 及更早的 Safari 不支持"模块型 Worker"，也不支持在 worker 里动态 import——
+  // 在那上面尝试只会得到"worker 出错"，实测还会把页面搞崩。与其崩，不如直接说清楚。
+  if (asrUnsupportedOS()) {
+    sub.state = 'error';
+    sub.err = '这台设备的 iPadOS 版本太旧：离线识别需要 Safari 15 以上才有的 Worker 能力。'
+            + '请到「设置 → 通用 → 软件更新」更新 iPadOS 后重试（这台机器支持更新）';
+    renderSubPanel();
+    return;
+  }
+  getDecodeCtx();   // 必须在用户手势任务内（此刻还没有任何 await）把音频上下文建出来，iOS 才认
   const key = t.key;
   const job = ++subJob;
   subClearTimer();
@@ -731,7 +782,9 @@ async function subStart() {
     } catch (e) {
       // 解码要单独给文案：此刻 dlPct 还是 0，而浏览器的解码报错（"Failed to execute..."）会被
       // 下面的下载失败正则吃掉，让用户对着一个永远解不开的文件去查网络、反复点重试。
-      throw subUserErr(SUB_DECODE_ERR);
+      // 附带底层原因（NotSupportedError / 内存不足 …）：否则出了事用户和我们都不知从何判断
+      const why = (e && (e.name || e.message)) || '';
+      throw subUserErr(SUB_DECODE_ERR + (why ? '（' + why + '）' : ''));
     }
     if (job !== subJob) return;
     sub.totalSec = samples.length / 16000;
