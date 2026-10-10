@@ -825,7 +825,7 @@ async function subStart() {
     if (job !== subJob) return;
     sub.totalSec = samples.length / 16000;
     // 上一次若在同一首歌上中断过（partial 记录），把已完成的分段读回来，从那里接着转，不重复劳动。
-    let chunks = [], doneSeg = 0;
+    let chunks = [], doneSeg = 0, gotSeg = false;
     const prev = await subGet(key);
     if (job !== subJob) return;
     if (prev && prev.partial && prev.doneSeg > 0 && prev.model === SUB_MODELS[subModel].id) {
@@ -853,13 +853,18 @@ async function subStart() {
           renderSubPanel();
         } else if (d.type === 'seg') {
           // 一段转完就落盘：页面若在这之后被系统干掉，下次可从这一段接着转。
+          gotSeg = true;
           chunks = chunks.concat(d.chunks || []);
           sub.segDone = d.i + 1; sub.device = d.device || sub.device;
           subRunMark('transcribe');
           subPut({ key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
                    durationSec: sub.totalSec, chunks: chunks, doneSeg: sub.segDone, partial: true });
           renderSubPanel();
-        } else if (d.type === 'done') { if (d.chunks && d.chunks.length) chunks = d.chunks; }
+        } else if (d.type === 'done') {
+          // 只有"收到过分段结果"时才采纳 done 里的整体结果：续转时 done 只含本次跑过的段，
+          // 直接覆盖会把上次已完成的前缀丢掉（这条 bug 是实测抓到的）。测试替身只发 done，故保留此路。
+          if (!gotSeg && d.chunks && d.chunks.length) chunks = d.chunks;
+        }
       },
     });
     try {
