@@ -547,9 +547,10 @@ const SUB_MODELS = {
 // 桌面浏览器和 iPad 都默认 base.en；iPad 走 q4 + 流式取样，避免模型和整首音频
 // 同时占用大量内存。small 仍不建议在移动 WebKit 上使用。
 const savedSubModel = LS.get('subModel', null);
-let subModel = SUB_MODELS[savedSubModel] ? savedSubModel : 'base';
-if (isBareWebKit() && subModel === 'small') {
-  subModel = 'base';
+const SUB_LS_BASE_DISABLED = 'subBaseDisabled';
+let subModel = SUB_MODELS[savedSubModel] ? savedSubModel : (isBareWebKit() ? 'tiny' : 'base');
+if (isBareWebKit() && (subModel === 'small' || LS.get(SUB_LS_BASE_DISABLED, false))) {
+  subModel = 'tiny';
   LS.set('subModel', subModel);
 }
 
@@ -877,12 +878,15 @@ function isBareWebKit() {
 function applySubModelLimits() {
   const select = A('subModel');
   if (!isBareWebKit()) return;
+  const baseDisabled = !!LS.get(SUB_LS_BASE_DISABLED, false);
   for (const option of select.options) {
-    option.disabled = option.value === 'small';
+    option.disabled = option.value === 'small' || (baseDisabled && option.value === 'base');
   }
   select.value = subModel;
   const hint = A('subHint');
-  hint.textContent = 'iPad/iPhone 使用流式取样；base.en 使用 q4 量化并按 60 秒分段，避免整首音频与模型同时占用内存。small.en 已禁用；转写时请保持屏幕常亮。';
+  hint.textContent = baseDisabled
+    ? '这台设备上次使用 base.en 时页面被系统回收，已自动停用 base；请使用 tiny.en，或改在电脑/原生 App 上生成字幕。'
+    : 'iPad/iPhone 使用流式取样；base.en 使用 q4 量化并按 60 秒分段，避免整首音频与模型同时占用内存。small.en 已禁用；转写时请保持屏幕常亮。';
 }
 
 function asrUnsupportedOS() {
@@ -931,7 +935,9 @@ async function streamAudioChunks(blob, { startSec, segmentSec, onChunk }) {
   const ctx = getDecodeCtx();
   const media = new Audio();
   const url = URL.createObjectURL(blob);
-  media.preload = 'auto'; media.muted = true; media.src = url;
+  // 不要设置 media.muted：Safari 上 MediaElementAudioSourceNode 可能会把静音状态
+  // 一并传给 Web Audio，导致 Worker 收到全零音频。真正的静音由后面的 gain=0 完成。
+  media.preload = 'auto'; media.muted = false; media.volume = 1; media.src = url;
   let source = null, processor = null, mute = null;
   let cancelled = false, ended = false, delivering = false;
   let resolveAll, rejectAll;
@@ -1517,6 +1523,10 @@ applySubModelLimits();
   if (crashedTier && crashedTier !== 'tiny') {
     subModel = 'tiny'; LS.set('subModel', 'tiny');
     extra.push('已自动改用更省内存的 tiny.en 档');
+    if (isBareWebKit() && crashedTier === 'base') {
+      LS.set(SUB_LS_BASE_DISABLED, true);
+      extra.push('本机已停用 base.en，避免再次崩溃');
+    }
   } else if (last.device === 'wasm') {
     extra.push('多半是内存吃紧：可先用更短的音频，或在电脑上预生成字幕再导入');
   }
@@ -1529,6 +1539,7 @@ applySubModelLimits();
   sub.crash = '上次生成中断在「' + (last.stage === 'transcribe' ? '转写中' : '准备模型') + '」阶段'
             + (bits.length ? '（' + bits.join('，') + '）' : '')
             + (extra.length ? '——' + extra.join('；') : '') + '，请再点一次生成';
+  applySubModelLimits();
   renderSubPanel();
 })();
 </script>
