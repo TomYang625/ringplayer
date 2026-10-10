@@ -115,8 +115,8 @@
         <span style="font-size:13px;white-space:nowrap">模型</span>
         <select id="subModel" style="flex:1">
           <option value="tiny">tiny.en · 39MB · 最快</option>
-          <option value="base">base.en · 73MB · 推荐</option>
-          <option value="small">small.en · 238MB · 更准</option>
+          <option value="base">base.en · q4 · 更准</option>
+          <option value="small">small.en · 238MB · 最准</option>
         </select>
       </div>
       <div class="row" id="subExportRow" hidden>
@@ -124,7 +124,7 @@
         <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
       </div>
       <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。
-        档位差别很大：tiny.en 最快（先用它试通），base.en 更准但慢好几倍，small.en 最准也最慢。</small>
+        iPad 上 base.en 使用 q4 量化并按 60 秒流式取样；tiny.en 更快，small.en 不建议使用。</small>
       <div id="subList"></div>
     </div>
 
@@ -540,29 +540,36 @@ syncRateUI();
 
 /* ============ 字幕：生成 ============ */
 const SUB_MODELS = {
-  tiny:  { id: 'onnx-community/whisper-tiny.en',  mb: 39  },
-  base:  { id: 'onnx-community/whisper-base.en',  mb: 73  },
-  small: { id: 'onnx-community/whisper-small.en', mb: 238 },
+  tiny:  { id: 'onnx-community/whisper-tiny.en',  dtype: 'q8', mb: 39  },
+  base:  { id: 'onnx-community/whisper-base.en',  dtype: 'q4', mb: 73  },
+  small: { id: 'onnx-community/whisper-small.en', dtype: 'q4', mb: 238 },
 };
-// 默认 base.en：真机实测（iPad mini 5 / wasm）处理 60 秒音频约 60 秒 ≈ 1 倍实时，可以接受，
-// 而它的英文准确度明显好于 tiny.en。要更快可在面板里改 tiny.en（约 2–3 倍实时）；
-// 选定后会记在 localStorage 里，不会被改回。
-let subModel = LS.get('subModel', 'base');
+// 桌面浏览器和 iPad 都默认 base.en；iPad 走 q4 + 流式取样，避免模型和整首音频
+// 同时占用大量内存。small 仍不建议在移动 WebKit 上使用。
+const savedSubModel = LS.get('subModel', null);
+let subModel = SUB_MODELS[savedSubModel] ? savedSubModel : 'base';
+if (isBareWebKit() && subModel === 'small') {
+  subModel = 'base';
+  LS.set('subModel', subModel);
+}
 
 /* 崩溃不留痕迹：把"跑到哪一步、用的哪个后端"随时写进 localStorage，成功/报错时清掉。
    页面若被浏览器干掉，这条记录就会留下——下次打开据此判断并自动改走更稳的路。 */
 const SUB_LS_RUN = 'subLastRun';
 function subRunMark(stage) {
   try { LS.set(SUB_LS_RUN, { stage, device: sub.device || '', model: subModel,
-        audioSec: Math.round(sub.totalSec), at: Date.now() }); } catch (e) {}
+        audioSec: Math.round(sub.totalSec), segDone: sub.segDone || 0,
+        elapsedSec: Math.round((Date.now() - sub.t0) / 1000), at: Date.now() }); } catch (e) {}
 }
 function subRunClear() { try { localStorage.removeItem(SUB_LS_RUN); } catch (e) {} }
 const SUB_LANG = 'en';
-const SUB_MAX_SEC = 30 * 60;   // 超过这个时长就别解了（见 subStart 里的说明）
+const SUB_MAX_SEC = isBareWebKit() ? 10 * 60 : 30 * 60;
+const SUB_MAX_SEC_LABEL = isBareWebKit() ? '10 分钟' : '30 分钟';
 // 分段转写的段长（秒）。段越短：进度越细、崩溃损失越小，但段间接缝越多（接缝处可能丢一个词）。
 // 取 120 秒：一段之内 whisper 自己还会按 30 秒开窗，接缝数量对常见长度来说已经很少。
-const SUB_SEG_SEC = 120;
-const SUB_TOO_LONG_ERR = '音频太长了：一次最多转写 30 分钟（更长的文件光解码就要占掉大量内存，iPad 上会崩），先裁短再试';
+const SUB_SEG_SEC = isBareWebKit() ? 60 : 120;
+const SUB_TOO_LONG_ERR = '音频太长了：这台设备一次最多转写 ' + SUB_MAX_SEC_LABEL
+  + '（更长的文件光解码就要占掉大量内存，iPad 上可能崩溃），先裁短再试';
 // 本机实测倍速（音频秒数 ÷ 转写秒数），按模型档分别记。第一次跑完后就有了，用来预估"这段要等多久"。
 const SUB_LS_SPEED = 'subSpeed';
 const SUB_DECODE_ERR = '这个文件浏览器解不开（格式不支持或文件已损坏），换一首再试';
@@ -578,7 +585,7 @@ let subTimer = null;
 // 与 Task 1 探针页里验证通过的同一份源码（探针页里的 log 分支在这里不需要，故略）
 const WORKER_SRC = `
 self.onmessage = async (e) => {
-  const { audio, model, lang, avoidWebgpu, startSeg } = e.data;
+  const { audio, model, lang, dtype, avoidWebgpu, startSeg } = e.data;
   try {
     // 先报一声"我起来了"：万一浏览器不支持这种内联 Worker / 外部模块加载，
     // 界面就能看出卡在哪一步，而不是只看到"已用 Xs"永远不动。
@@ -610,7 +617,7 @@ self.onmessage = async (e) => {
     self.postMessage({ type:'device', device: device });
 
     const mkPipe = (dev) => pipeline('automatic-speech-recognition', model, {
-      dtype: 'q8',
+      dtype: dtype || 'q8',
       device: dev,
       progress_callback: (x) => {
         if (x.status === 'progress' && x.loaded)
@@ -647,7 +654,9 @@ self.onmessage = async (e) => {
     const from = Math.max(0, Math.min(startSeg | 0, nSeg - 1));
     let all = [], text = '';
     for (let i = from; i < nSeg; i++) {
-      const seg = audio.subarray(i * segLen, Math.min((i + 1) * segLen, audio.length));
+      // 用 slice 拷贝而不是 subarray 视图：库/ONNX 有可能把传入缓冲 detach，
+      // 那样第二段就会读到失效内存（每段拷贝约 8MB，可忽略）。
+      const seg = audio.slice(i * segLen, Math.min((i + 1) * segLen, audio.length));
       const out = await pipe(seg, asrOpts);
       const base = i * ${SUB_SEG_SEC};
       const part = (out.chunks || []).map(c => {
@@ -669,12 +678,69 @@ function createAsrWorker(workerType) {
   return new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })), { type: workerType });
 }
 
+// iPad 的流式路径：Worker 只保留模型和当前 60 秒片段，不接收整首音频。
+const STREAM_WORKER_SRC = `
+let pipe = null, asrOpts = null, device = 'wasm';
+async function start(d) {
+  self.postMessage({ type:'boot' });
+  const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1');
+  const { pipeline, env } = mod;
+  env.remoteHost = 'https://hf-mirror.com';
+  env.allowLocalModels = false;
+  const dtype = d.dtype || 'q4';
+  pipe = await pipeline('automatic-speech-recognition', d.model, {
+    dtype,
+    device: 'wasm',
+    progress_callback: (x) => {
+      if (x.status === 'progress' && x.loaded)
+        self.postMessage({ type:'download', loaded:x.loaded, total:x.total || 0, file:x.file || '' });
+    },
+  });
+  asrOpts = {
+    return_timestamps: true,
+    chunk_length_s: 30,
+    stride_length_s: 5,
+    token_callback_function: () => self.postMessage({ type:'alive' }),
+  };
+  if (!/\\.en$/.test(d.model)) { asrOpts.language = d.lang; asrOpts.task = 'transcribe'; }
+  self.postMessage({ type:'device', device });
+  self.postMessage({ type:'ready', device });
+}
+self.onmessage = async (e) => {
+  const d = e.data;
+  try {
+    if (d.type === 'start') return await start(d);
+    if (d.type === 'segment') {
+      if (!pipe) throw new Error('识别器尚未准备好');
+      const out = await pipe(new Float32Array(d.audio), asrOpts);
+      const base = d.base || 0;
+      const chunks = (out.chunks || []).map(c => {
+        const ts = c.timestamp || [];
+        return { timestamp: [ts[0] == null ? null : ts[0] + base,
+                             ts[1] == null ? null : ts[1] + base], text: c.text };
+      });
+      self.postMessage({ type:'seg', i:d.i, n:d.n, chunks, device });
+      return;
+    }
+    if (d.type === 'finish') self.postMessage({ type:'done', device });
+  } catch (err) {
+    self.postMessage({ type:'err', text:String((err && err.message) || err) });
+  }
+};
+`;
+function createStreamWorker() {
+  return new Worker(URL.createObjectURL(new Blob([STREAM_WORKER_SRC], { type: 'text/javascript' })), { type: 'module' });
+}
+
 // 正在跑的转写 worker。取消机制只有 terminate() 一条路：只靠 subJob 递增只是丢弃结果，
 // 推理本身会一路跑完（几分钟满 CPU + 占着内存），换档重开还会同时跑两条 Whisper 管线。
 let subWorker = null;
 let subWorkerCancel = null;
+let subCaptureCancel = null;
 function cancelAsrJob() {
   const c = subWorkerCancel; subWorkerCancel = null;
+  const stopCapture = subCaptureCancel; subCaptureCancel = null;
+  if (stopCapture) { try { stopCapture(); } catch (e) {} }
   // 顺序要紧：terminate() 不发任何事件，先让 startAsrJob 里挂着的 done 落定，
   // 否则那个 await 永不结算，subStart 的 async 帧（连同 samples 和解码后的音频）就退不掉。
   if (c) { try { c(); } catch (e) {} }
@@ -713,10 +779,78 @@ async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module', s
   // 纯 WebKit 一律先走 wasm：实测（iPad mini 5 / iPadOS 26）WebGPU 路径会把页面搞崩
   // （tiny 在推理时、base 在建管线时），而 wasm 实测约 1 倍实时、可以接受——不值得让用户拿一次崩溃换速度。
   const avoidWebgpu = !!LS.get('subAvoidWebgpu', false) || isBareWebKit();
-  w.postMessage({ audio, model, lang, startSeg: startSeg, avoidWebgpu: avoidWebgpu }, [audio.buffer]);
+  w.postMessage({ audio, model, lang, dtype: SUB_MODELS[subModel].dtype,
+                  startSeg: startSeg, avoidWebgpu: avoidWebgpu }, [audio.buffer]);
   try { await done; }
   finally {
     if (subWorker === w) { subWorker = null; subWorkerCancel = null; }  // 已被取消或已被新任务接管就别再动
+    try { w.terminate(); } catch (e) {}
+  }
+}
+
+async function startAsrStreamJob({ blob, model, dtype, lang, totalSec, startSeg, onMsg }) {
+  if (window.__asrStub) {
+    const samples = await decodeToMono16k(blob);
+    await window.__asrStub(samples, model, onMsg);
+    return;
+  }
+  let w;
+  try { w = createStreamWorker(); }
+  catch (err) {
+    const e = subUserErr('流式识别器启动失败：这个浏览器不支持模块型 Worker（'
+      + String((err && err.message) || err) + '）');
+    e.__startupFailed = true;
+    throw e;
+  }
+  subWorker = w;
+  let gotMessage = false;
+  let readyResolve, readyReject, doneResolve, doneReject, pendingSegment = null;
+  const ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
+  const done = new Promise((res, rej) => { doneResolve = res; doneReject = rej; });
+  subWorkerCancel = () => {
+    const e = new Error('已取消'); e.__asrCancelled = true;
+    if (pendingSegment) pendingSegment.reject(e);
+    readyReject(e); doneReject(e);
+  };
+  w.onmessage = (event) => {
+    gotMessage = true;
+    const d = event.data;
+    onMsg(d);
+    if (d.type === 'ready') readyResolve();
+    else if (d.type === 'seg' && pendingSegment) {
+      const p = pendingSegment; pendingSegment = null; p.resolve();
+    } else if (d.type === 'done') doneResolve();
+    else if (d.type === 'err') {
+      const e = new Error(d.text);
+      readyReject(e); doneReject(e);
+      if (pendingSegment) { pendingSegment.reject(e); pendingSegment = null; }
+    }
+  };
+  w.onerror = (event) => {
+    const e = new Error((event && event.message) || 'worker 出错');
+    e.__startupFailed = !gotMessage;
+    readyReject(e); doneReject(e);
+    if (pendingSegment) { pendingSegment.reject(e); pendingSegment = null; }
+  };
+  try {
+    w.postMessage({ type:'start', model, dtype, lang });
+    await ready;
+    const nSeg = Math.max(1, Math.ceil(totalSec / SUB_SEG_SEC));
+    const from = Math.max(0, Math.min(startSeg | 0, nSeg - 1));
+    await streamAudioChunks(blob, {
+      startSec: from * SUB_SEG_SEC,
+      segmentSec: SUB_SEG_SEC,
+      onChunk: (chunk, localIndex) => new Promise((resolve, reject) => {
+        const i = from + localIndex;
+        pendingSegment = { resolve, reject };
+        w.postMessage({ type:'segment', audio: chunk.buffer, i, n: nSeg,
+                        base: i * SUB_SEG_SEC }, [chunk.buffer]);
+      }),
+    });
+    w.postMessage({ type:'finish' });
+    await done;
+  } finally {
+    if (subWorker === w) { subWorker = null; subWorkerCancel = null; }
     try { w.terminate(); } catch (e) {}
   }
 }
@@ -740,6 +874,17 @@ function isBareWebKit() {
   return /AppleWebKit/.test(ua) && !/(Chrome\/|Chromium\/|Edg\/|OPR\/|SamsungBrowser)/.test(ua);
 }
 
+function applySubModelLimits() {
+  const select = A('subModel');
+  if (!isBareWebKit()) return;
+  for (const option of select.options) {
+    option.disabled = option.value === 'small';
+  }
+  select.value = subModel;
+  const hint = A('subHint');
+  hint.textContent = 'iPad/iPhone 使用流式取样；base.en 使用 q4 量化并按 60 秒分段，避免整首音频与模型同时占用内存。small.en 已禁用；转写时请保持屏幕常亮。';
+}
+
 function asrUnsupportedOS() {
   if (!isBareWebKit()) return false;                         // 非 WebKit 不受此限
   const ua = navigator.userAgent || '';
@@ -756,6 +901,126 @@ function getDecodeCtx() {
   if (!decodeCtx) decodeCtx = new AC({ sampleRate: 16000 });
   if (decodeCtx.state === 'suspended' && decodeCtx.resume) decodeCtx.resume().catch(() => {});
   return decodeCtx;
+}
+
+function resampleCaptureBlock(input, fromRate) {
+  if (fromRate === 16000) return input;
+  const outLen = Math.max(1, Math.floor(input.length * 16000 / fromRate));
+  const out = new Float32Array(outLen);
+  const step = fromRate / 16000;
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * step;
+    const left = Math.floor(pos);
+    const right = Math.min(left + 1, input.length - 1);
+    const frac = pos - left;
+    out[i] = input[left] * (1 - frac) + input[right] * frac;
+  }
+  return out;
+}
+
+function concatCaptureParts(parts, length) {
+  const out = new Float32Array(length);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
+// 通过静音 MediaElementAudioSourceNode 逐段取得 PCM。浏览器负责流式解码 MP3/M4A，
+// 主线程只保留当前段，避免 decodeAudioData 同时创建整首 AudioBuffer 和完整 samples。
+async function streamAudioChunks(blob, { startSec, segmentSec, onChunk }) {
+  const ctx = getDecodeCtx();
+  const media = new Audio();
+  const url = URL.createObjectURL(blob);
+  media.preload = 'auto'; media.muted = true; media.src = url;
+  let source = null, processor = null, mute = null;
+  let cancelled = false, ended = false, delivering = false;
+  let resolveAll, rejectAll;
+  const allDone = new Promise((res, rej) => { resolveAll = res; rejectAll = rej; });
+  const target = Math.max(16000, Math.floor(segmentSec * 16000));
+  let parts = [], partLength = 0, segmentIndex = 0;
+
+  const cleanup = () => {
+    try { media.pause(); } catch (e) {}
+    try { if (processor) processor.disconnect(); } catch (e) {}
+    try { if (source) source.disconnect(); } catch (e) {}
+    try { if (mute) mute.disconnect(); } catch (e) {}
+    media.removeAttribute('src');
+    try { media.load(); } catch (e) {}
+    URL.revokeObjectURL(url);
+  };
+  const abort = () => {
+    if (cancelled) return;
+    cancelled = true;
+    cleanup();
+    const e = new Error('已取消'); e.__asrCancelled = true;
+    rejectAll(e);
+  };
+  subCaptureCancel = abort;
+
+  try {
+    await new Promise((resolve, reject) => {
+      media.onloadedmetadata = resolve;
+      media.onerror = () => reject(new Error('音频流无法解码'));
+    });
+    if (!isFinite(media.duration) || media.duration <= 0) throw new Error('音频时长不可用');
+    media.currentTime = Math.min(Math.max(0, startSec || 0), Math.max(0, media.duration - 0.01));
+    await ctx.resume();
+
+    source = ctx.createMediaElementSource(media);
+    processor = ctx.createScriptProcessor(4096, 2, 1);
+    mute = ctx.createGain(); mute.gain.value = 0;
+    source.connect(processor); processor.connect(mute); mute.connect(ctx.destination);
+
+    const maybeFlush = (force) => {
+      if (cancelled || delivering || !partLength || (!force && partLength < target)) return;
+      const all = concatCaptureParts(parts, partLength);
+      const take = force ? all.length : target;
+      const chunk = all.slice(0, take);
+      const rest = all.length > take ? all.slice(take) : null;
+      parts = rest && rest.length ? [rest] : [];
+      partLength = rest ? rest.length : 0;
+      delivering = true;
+      media.pause();
+      Promise.resolve(onChunk(chunk, segmentIndex++)).then(() => {
+        delivering = false;
+        if (cancelled) return;
+        if (ended) {
+          if (partLength) maybeFlush(true); else { cleanup(); resolveAll(); }
+        } else {
+          const p = media.play();
+          if (p && p.catch) p.catch(rejectAll);
+        }
+      }).catch(rejectAll);
+    };
+
+    processor.onaudioprocess = (event) => {
+      if (cancelled || delivering) return;
+      const input = event.inputBuffer;
+      const channels = input.numberOfChannels;
+      const frames = input.length;
+      const mono = new Float32Array(frames);
+      for (let c = 0; c < channels; c++) {
+        const data = input.getChannelData(c);
+        for (let i = 0; i < frames; i++) mono[i] += data[i] / channels;
+      }
+      const resampled = resampleCaptureBlock(mono, ctx.sampleRate);
+      parts.push(resampled); partLength += resampled.length;
+      maybeFlush(false);
+    };
+    media.onended = () => {
+      ended = true;
+      if (!delivering) {
+        if (partLength) maybeFlush(true);
+        else { cleanup(); resolveAll(); }
+      }
+    };
+    const playing = media.play();
+    if (playing && playing.catch) await playing;
+    await allDone;
+  } finally {
+    if (subCaptureCancel === abort) subCaptureCancel = null;
+    cleanup();
+  }
 }
 
 async function decodeToMono16k(blob) {
@@ -802,6 +1067,73 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && sub.state === 'running') subWakeOn();
 });
 
+async function subStartStreaming(t, key, job) {
+  if (!isFinite(sub.totalSec) || sub.totalSec <= 0) throw subUserErr(SUB_DECODE_ERR);
+  if (sub.totalSec > SUB_MAX_SEC) throw subUserErr(SUB_TOO_LONG_ERR);
+  let chunks = [], doneSeg = 0, gotSeg = false;
+  const prev = await subGet(key);
+  if (job !== subJob) return;
+  if (prev && prev.partial && prev.doneSeg > 0 && prev.segSec === SUB_SEG_SEC
+      && prev.model === SUB_MODELS[subModel].id) {
+    chunks = prev.chunks || [];
+    doneSeg = prev.doneSeg;
+  }
+  sub.segDone = doneSeg;
+  sub.segTotal = Math.max(1, Math.ceil(sub.totalSec / SUB_SEG_SEC));
+  sub.phase = 'prep';
+  subRunMark('prep');
+  renderSubPanel();
+  await startAsrStreamJob({
+    blob: t.blob,
+    model: SUB_MODELS[subModel].id,
+    dtype: SUB_MODELS[subModel].dtype,
+    lang: SUB_LANG,
+    totalSec: sub.totalSec,
+    startSeg: doneSeg,
+    onMsg: (d) => {
+      if (job !== subJob) return;
+      sub.lastAt = Date.now();
+      if (d.type === 'boot') { sub.booted = true; renderSubPanel(); }
+      else if (d.type === 'device') { sub.device = d.device || ''; subRunMark(sub.phase); }
+      else if (d.type === 'download') {
+        sub.dlLoaded = d.loaded; sub.dlTotal = d.total;
+        sub.dlPct = d.total ? d.loaded / d.total : 0;
+        renderSubPanel();
+      } else if (d.type === 'ready') {
+        sub.phase = 'transcribe'; sub.device = d.device || '';
+        sub.tTrans = Date.now(); subRunMark('transcribe'); renderSubPanel();
+      } else if (d.type === 'seg') {
+        gotSeg = true;
+        chunks = chunks.concat(d.chunks || []);
+        sub.segDone = d.i + 1; sub.device = d.device || sub.device;
+        subRunMark('transcribe');
+        subPut({ key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
+                 durationSec: sub.totalSec, chunks, doneSeg: sub.segDone, segSec: SUB_SEG_SEC, partial: true });
+        renderSubPanel();
+      } else if (d.type === 'done' && !gotSeg && d.chunks && d.chunks.length) {
+        chunks = d.chunks;
+      }
+    },
+  });
+  if (job !== subJob) return;
+  const chunksOut = (chunks || []).map(c => {
+    const ts = c.timestamp || [];
+    const s = c.s !== undefined ? c.s : (ts[0] || 0);
+    let e = c.e !== undefined ? c.e : (ts[1] != null ? ts[1] : null);
+    if (e == null || e < s) e = Math.max(s, sub.totalSec);
+    return { s, e, text: (c.text || '').trim() };
+  }).filter(c => c.text);
+  const rec = { key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
+                durationSec: sub.totalSec, chunks: chunksOut, doneSeg: sub.segTotal,
+                segSec: SUB_SEG_SEC, partial: false };
+  sub.rec = rec; sub.state = rec.chunks.length ? 'done' : 'error';
+  if (!rec.chunks.length) sub.err = '这段音频没识别出任何句子';
+  else {
+    try { await subPut(rec); }
+    catch (e) { if (job === subJob) sub.warn = SUB_SAVE_WARN; }
+  }
+}
+
 async function subStart() {
   const t = tracks[cur]; if (!t) return;
   // iPadOS 14 及更早的 Safari 不支持"模块型 Worker"，也不支持在 worker 里动态 import——
@@ -827,6 +1159,13 @@ async function subStart() {
   subTimer = setInterval(() => { if (sub.state === 'running') renderSubPanel(); }, 1000);
   try {
     if (!t.url) t.url = URL.createObjectURL(t.blob);
+    if (isBareWebKit()) {
+      await subStartStreaming(t, key, job);
+      if (job !== subJob) return;
+      subClearTimer(); subRunClear(); renderSubPanel(); renderSubList();
+      subSyncLine(audio.currentTime * 1000, true); subWakeOff();
+      return;
+    }
     // 超长音频在解码前就挡掉：decodeAudioData 要把整段解成原始采样率的 float32
     // （1 小时立体声 ≈1.3GB），Safari 上必然在解码里失败，且那条失败信息无法与"文件解不开"区分。
     if (isFinite(audio.duration) && audio.duration > SUB_MAX_SEC) throw subUserErr(SUB_TOO_LONG_ERR);
@@ -842,11 +1181,13 @@ async function subStart() {
     }
     if (job !== subJob) return;
     sub.totalSec = samples.length / 16000;
+    if (sub.totalSec > SUB_MAX_SEC) throw subUserErr(SUB_TOO_LONG_ERR);
     // 上一次若在同一首歌上中断过（partial 记录），把已完成的分段读回来，从那里接着转，不重复劳动。
     let chunks = [], doneSeg = 0, gotSeg = false;
     const prev = await subGet(key);
     if (job !== subJob) return;
-    if (prev && prev.partial && prev.doneSeg > 0 && prev.model === SUB_MODELS[subModel].id) {
+    if (prev && prev.partial && prev.doneSeg > 0 && prev.segSec === SUB_SEG_SEC
+        && prev.model === SUB_MODELS[subModel].id) {
       chunks = prev.chunks || [];
       doneSeg = prev.doneSeg;
     }
@@ -878,7 +1219,8 @@ async function subStart() {
           sub.segDone = d.i + 1; sub.device = d.device || sub.device;
           subRunMark('transcribe');
           subPut({ key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
-                   durationSec: sub.totalSec, chunks: chunks, doneSeg: sub.segDone, partial: true });
+                   durationSec: sub.totalSec, chunks: chunks, doneSeg: sub.segDone,
+                   segSec: SUB_SEG_SEC, partial: true });
           renderSubPanel();
         } else if (d.type === 'done') {
           // 只有"收到过分段结果"时才采纳 done 里的整体结果：续转时 done 只含本次跑过的段，
@@ -912,7 +1254,7 @@ async function subStart() {
     }).filter(c => c.text);
     const rec = { key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
                   durationSec: sub.totalSec, chunks: chunksOut,
-                  doneSeg: sub.segTotal, partial: false };
+                  doneSeg: sub.segTotal, segSec: SUB_SEG_SEC, partial: false };
     sub.rec = rec; sub.state = rec.chunks.length ? 'done' : 'error';
     if (!rec.chunks.length) sub.err = '这段音频没识别出任何句子';
     else {
@@ -929,7 +1271,7 @@ async function subStart() {
     if (job !== subJob) return;
     const msg = String((e && e.message) || e);
     if (e && e.__userFacing) sub.err = msg;   // 解码失败/超长：文案已经是给用户看的，不再映射
-    else if (/memory|allocation|RangeError/i.test(msg)) sub.err = '内存不足：改用 base 或 tiny 档再试';
+    else if (/memory|allocation|RangeError/i.test(msg)) sub.err = '内存不足：改用 tiny 档或更短的音频再试';
     else if (sub.dlPct < 1 && /fetch|network|HTTP|Failed/i.test(msg)) sub.err = '模型下载失败（检查网络/镜像），点重试';
     else if (/worker 出错|识别器启动失败/.test(msg))
       sub.err = '识别器没能启动：这个浏览器可能不支持离线识别所需的 Worker 方式（两种形式都试过了）。'
@@ -1079,12 +1421,15 @@ function subOnTrackChanged() {
   renderSubList(); renderSubPanel();
   const k = curKey(); if (!k) return;
   subGet(k).then(r => {
-    if (r && r.partial && r.doneSeg > 0) {
+    if (r && r.partial && r.doneSeg > 0 && r.segSec === SUB_SEG_SEC) {
       // 上次转到一半被打断：先把已有的显示出来，并说明"再点一次生成会接着转"
       sub.rec = r; sub.state = 'ready';
       sub.crash = '上次转到 ' + r.doneSeg + '/'
                 + Math.max(1, Math.ceil((r.durationSec || 0) / SUB_SEG_SEC)) + ' 段中断，'
                 + '再点一次「生成字幕」会接着转';
+    } else if (r && r.partial) {
+      sub.state = 'ready';
+      sub.crash = '已有未完成字幕使用旧分段方式，再点一次「生成字幕」会从头转写';
     } else if (r && r.chunks && r.chunks.length) { sub.rec = r; sub.state = 'done'; }
     else sub.state = 'ready';
     renderSubPanel(); renderSubList();
@@ -1102,7 +1447,12 @@ A('subDel').addEventListener('click', async () => {
   const k = curKey(); if (k) await subDelete(k);
   sub.rec = null; sub.state = 'ready'; renderSubList(); renderSubPanel(); subSyncLine(0, true);
 });
-A('subModel').addEventListener('change', () => { subModel = A('subModel').value; LS.set('subModel', subModel); renderSubPanel(); });
+A('subModel').addEventListener('change', () => {
+  subModel = isBareWebKit() && A('subModel').value === 'small' ? 'base' : A('subModel').value;
+  A('subModel').value = subModel;
+  LS.set('subModel', subModel);
+  renderSubPanel();
+});
 
 /* ============ 字幕：导出 ============ */
 function srtTime(sec) {
@@ -1145,6 +1495,7 @@ if ('serviceWorker' in navigator &&
 }
 
 renderSubPanel();   // 首屏就按当前状态渲染（无曲目时提示先选歌；有曲目时 loadStored→subOnTrackChanged 会再渲染一次）
+applySubModelLimits();
 
 // 上次生成若在「准备模型/转写中」阶段留下了记录却没有被清掉，说明页面是在那时被浏览器干掉的
 // （崩溃不留任何痕迹，所以只能靠这条记录）。据此给出说明，并在疑似 GPU 路径上自动改走 wasm。
@@ -1152,20 +1503,32 @@ renderSubPanel();   // 首屏就按当前状态渲染（无曲目时提示先选
   const last = LS.get(SUB_LS_RUN, null);
   if (!last || sub.state === 'running') return;
   subRunClear();
-  let extra = '';
-  // 只要上次是**在 webgpu 上**中断（任何阶段，包括"建管线"时），或"准备阶段中断且来不及记录后端"
-  // （这种签名正是 GPU 初始化崩溃），就以后不再走 webgpu。
+  const extra = [];
+  // 后端：只要上次是**在 webgpu 上**中断（任何阶段，包括"建管线"时），或"准备阶段中断且来不及记录后端"
+  // （这种签名正是 GPU 初始化崩溃），以后就不再走 webgpu。
   const wasWebgpu = last.device === 'webgpu';
   const prepNoDevice = last.stage !== 'transcribe' && !last.device;
   if ((wasWebgpu || prepNoDevice) && !LS.get('subAvoidWebgpu', false)) {
     LS.set('subAvoidWebgpu', true);
-    extra = '——已自动改用更稳的 wasm 方式';
-  } else if (last.device === 'wasm') {
-    extra = '——这台设备连 wasm 方式也中断了，多半是内存吃紧：建议改用 tiny.en 档或更短的音频';
+    extra.push('已自动改用更稳的 wasm 方式');
   }
+  // 档位：崩溃若发生在 base/small 上，基本就是内存不够（实测同一台 iPad：base 崩、tiny 能跑）→ 自动降到 tiny
+  const crashedTier = Object.keys(SUB_MODELS).find((k) => SUB_MODELS[k].id === last.model);
+  if (crashedTier && crashedTier !== 'tiny') {
+    subModel = 'tiny'; LS.set('subModel', 'tiny');
+    extra.push('已自动改用更省内存的 tiny.en 档');
+  } else if (last.device === 'wasm') {
+    extra.push('多半是内存吃紧：可先用更短的音频，或在电脑上预生成字幕再导入');
+  }
+  // 把"跑到第几段、用了多久"一并写出来：这是判断"内存随段数增长"还是"跑久了被系统回收"的关键
+  const bits = [];
+  if (last.device) bits.push(last.device);
+  if (last.model) bits.push(String(last.model).split('/').pop());
+  if (last.segDone) bits.push('已跑 ' + last.segDone + ' 段');
+  if (last.elapsedSec) bits.push('用时 ' + fmtElapsed(last.elapsedSec));
   sub.crash = '上次生成中断在「' + (last.stage === 'transcribe' ? '转写中' : '准备模型') + '」阶段'
-            + (last.device ? '（' + last.device + (last.model ? '，' + last.model : '') + '）' : '')
-            + extra + '，请再点一次生成';
+            + (bits.length ? '（' + bits.join('，') + '）' : '')
+            + (extra.length ? '——' + extra.join('；') : '') + '，请再点一次生成';
   renderSubPanel();
 })();
 </script>
