@@ -605,6 +605,9 @@ self.onmessage = async (e) => {
         ? await navigator.gpu.requestAdapter() : null;
       if (adapter) device = 'webgpu';
     } catch (err) { device = 'wasm'; }
+    // 立刻把选定后端报回去：崩溃可能发生在"建管线"阶段（webgpu 初始化是已知崩溃点），
+    // 那时若还没记录后端，主线程就无法判断该不该在下次改走 wasm。
+    self.postMessage({ type:'device', device: device });
 
     const mkPipe = (dev) => pipeline('automatic-speech-recognition', model, {
       dtype: 'q8',
@@ -707,8 +710,10 @@ async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module', s
       reject(err);
     };
   });
-  w.postMessage({ audio, model, lang, startSeg: startSeg,
-                  avoidWebgpu: !!LS.get('subAvoidWebgpu', false) }, [audio.buffer]);
+  // 纯 WebKit 一律先走 wasm：实测（iPad mini 5 / iPadOS 26）WebGPU 路径会把页面搞崩
+  // （tiny 在推理时、base 在建管线时），而 wasm 实测约 1 倍实时、可以接受——不值得让用户拿一次崩溃换速度。
+  const avoidWebgpu = !!LS.get('subAvoidWebgpu', false) || isBareWebKit();
+  w.postMessage({ audio, model, lang, startSeg: startSeg, avoidWebgpu: avoidWebgpu }, [audio.buffer]);
   try { await done; }
   finally {
     if (subWorker === w) { subWorker = null; subWorkerCancel = null; }  // 已被取消或已被新任务接管就别再动
@@ -726,9 +731,18 @@ async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module', s
 // 依据：iPadOS 13+ 的 Safari 用桌面式 UA，UA 里没有 "OS 14_"，但 Version/ 与系统大版本基本同步；
 // iPad 上的 Chrome/Firefox 也跑 WebKit，UA 里带 "OS 14_4" 之类，同样能识别。
 // 判错只影响"要不要直接给提示"：判成旧设备 = 不尝试 Worker（不崩）；判成新设备 = 照常尝试（可能失败但有兜底）。
-function asrUnsupportedOS() {
+// 是不是"纯 WebKit"（Safari，以及 iPad/iPhone 上的 Chrome·Firefox——它们也跑 WebKit）。
+// 注意：Chromium 系（桌面 Chrome/Edge）的 UA 里**也**有 AppleWebKit，所以不能只靠它判断。
+function isBareWebKit() {
   const ua = navigator.userAgent || '';
-  if (!/AppleWebKit/.test(ua)) return false;                 // 非 WebKit（桌面 Chrome 等）不受此限
+  // 只排除 Blink 系（桌面 Chrome/Chromium/Edge/Opera/Samsung）——它们靠 "Chrome/" 这类标记区分。
+  // iOS/iPadOS 上的 Chrome(CriOS)、Firefox(FxiOS) 只是换了外壳，内核仍是 WebKit，必须算进来。
+  return /AppleWebKit/.test(ua) && !/(Chrome\/|Chromium\/|Edg\/|OPR\/|SamsungBrowser)/.test(ua);
+}
+
+function asrUnsupportedOS() {
+  if (!isBareWebKit()) return false;                         // 非 WebKit 不受此限
+  const ua = navigator.userAgent || '';
   const os = /OS (\d+)[_.]/.exec(ua);
   const ver = /Version\/(\d+)/.exec(ua);
   const osMajor = os ? +os[1] : 0;
@@ -847,6 +861,7 @@ async function subStart() {
         if (job !== subJob) return;
         sub.lastAt = Date.now();
         if (d.type === 'boot') { sub.booted = true; renderSubPanel(); }
+        else if (d.type === 'device') { sub.device = d.device || ''; subRunMark(sub.phase); }
         else if (d.type === 'download') {
           sub.dlLoaded = d.loaded; sub.dlTotal = d.total;
           sub.dlPct = d.total ? d.loaded / d.total : 0;
@@ -1138,9 +1153,15 @@ renderSubPanel();   // 首屏就按当前状态渲染（无曲目时提示先选
   if (!last || sub.state === 'running') return;
   subRunClear();
   let extra = '';
-  if (last.stage === 'transcribe' && last.device === 'webgpu' && !LS.get('subAvoidWebgpu', false)) {
-    LS.set('subAvoidWebgpu', true);      // GPU 路径疑似把页面搞崩过 → 以后直接走 wasm，不再赌
+  // 只要上次是**在 webgpu 上**中断（任何阶段，包括"建管线"时），或"准备阶段中断且来不及记录后端"
+  // （这种签名正是 GPU 初始化崩溃），就以后不再走 webgpu。
+  const wasWebgpu = last.device === 'webgpu';
+  const prepNoDevice = last.stage !== 'transcribe' && !last.device;
+  if ((wasWebgpu || prepNoDevice) && !LS.get('subAvoidWebgpu', false)) {
+    LS.set('subAvoidWebgpu', true);
     extra = '——已自动改用更稳的 wasm 方式';
+  } else if (last.device === 'wasm') {
+    extra = '——这台设备连 wasm 方式也中断了，多半是内存吃紧：建议改用 tiny.en 档或更短的音频';
   }
   sub.crash = '上次生成中断在「' + (last.stage === 'transcribe' ? '转写中' : '准备模型') + '」阶段'
             + (last.device ? '（' + last.device + (last.model ? '，' + last.model : '') + '）' : '')
