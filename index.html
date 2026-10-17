@@ -52,11 +52,15 @@
   #centerBtn:active{opacity:.8}
   #timeRow{display:flex;justify-content:space-between;font-size:16px;color:var(--sub);font-variant-numeric:tabular-nums;margin-top:2px}
   #cur{color:var(--accent);font-weight:600}
-  #seek{width:100%;accent-color:var(--accent);margin:2px 0 6px}
-  /* A-B 循环区间条：两端圆点可直接拖动；中间高亮段 = 循环区间 */
-  #loopBar{position:relative;height:30px;margin:-2px 0 2px;touch-action:none;user-select:none;-webkit-user-select:none}
-  #loopBar::before{content:'';position:absolute;left:0;right:0;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.14)}
-  #loopSeg{position:absolute;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.45);pointer-events:none}
+  /* 进度条：播放进度、圆点 A/B、循环区间高亮全部画在同一根轴上（整首曲子） */
+  #pbarWrap{position:relative;height:34px;margin:0 0 2px;touch-action:none;user-select:none;-webkit-user-select:none}
+  /* 原生滑杆保留给键盘/脚本（value 仍是 0..1000），视觉与触控都交给下面的自绘进度条 */
+  #seek{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;pointer-events:none}
+  #pbar{position:absolute;inset:0;touch-action:none;cursor:pointer}
+  #pbar::before{content:'';position:absolute;left:0;right:0;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.14)}
+  #pfill{position:absolute;left:0;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.6);pointer-events:none}
+  #pseg{position:absolute;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.42);pointer-events:none}
+  #pthumb{position:absolute;top:50%;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;background:var(--accent);pointer-events:none}
   .loopHandle{position:absolute;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;
     border:2px solid var(--track);background:var(--bg);color:var(--sub);font-size:10px;font-weight:700;font-style:normal;
     display:flex;align-items:center;justify-content:center;touch-action:none;cursor:grab;z-index:1}
@@ -156,11 +160,15 @@
 
   <div id="subline"></div>
   <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
-  <input type="range" id="seek" min="0" max="1000" value="0">
-  <div id="loopBar" hidden>
-    <div id="loopSeg" hidden></div>
-    <div class="loopHandle" id="hA" role="slider" aria-label="循环起点 A">A</div>
-    <div class="loopHandle" id="hB" role="slider" aria-label="循环终点 B">B</div>
+  <div id="pbarWrap">
+    <input type="range" id="seek" min="0" max="1000" value="0" aria-label="播放进度">
+    <div id="pbar">
+      <div id="pfill"></div>
+      <div id="pseg" hidden></div>
+      <div id="pthumb"></div>
+      <div class="loopHandle" id="hA" role="slider" aria-label="循环起点 A" hidden>A</div>
+      <div class="loopHandle" id="hB" role="slider" aria-label="循环终点 B" hidden>B</div>
+    </div>
   </div>
   <div id="loopInfo" hidden>
     <span id="loopInfoTxt"></span>
@@ -332,16 +340,18 @@ function paint() {
   durEl.textContent = fmt(duration);
   seekEl.value = Math.round(f * 1000);
   subSyncLine(dragging ? dragTarget : audio.currentTime * 1000);
-  paintLoopBar();
+  paintBar();
 }
 function rafLoop() { loopTick(); paint(); rafId = requestAnimationFrame(rafLoop); }
 function startLoop() { if (!rafId) rafId = requestAnimationFrame(rafLoop); }
 function stopLoop() { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } }
 
-/* ============ A-B 循环：区间条拖拽 ============ */
-const loopBarEl = A('loopBar'), loopSegEl = A('loopSeg'), hAEl = A('hA'), hBEl = A('hB'),
+/* ============ 进度条：播放进度 + A/B 圆点（同一根轴） ============ */
+const pbarEl = A('pbar'), pfillEl = A('pfill'), psegEl = A('pseg'), pthumbEl = A('pthumb'),
+      hAEl = A('hA'), hBEl = A('hB'),
       loopInfoEl = A('loopInfo'), loopInfoTxt = A('loopInfoTxt'), loopClearBtn = A('loopClear');
 let loopDrag = null;   // { which:'a'|'b', offset: 按住点相对把手的偏移（0..1 的比例） }
+let seekDrag = false;  // 正在拖进度条主体（定位播放头）
 
 function loopActive() { return loop.a != null && loop.b != null && loop.b - loop.a >= LOOP_MIN_MS; }
 
@@ -363,22 +373,27 @@ function saveLoop() {
 function updateHint() {
   const el = A('hint');
   if (!tracks[cur]) el.textContent = '顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 播完自动重播';
-  else if (loopActive()) el.textContent = 'A-B 循环中：播放到 B 自动跳回 A · 拖动下方 A/B 圆点可调整 · 点中央播放/暂停';
-  else el.textContent = '顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 拖动下方 A/B 圆点设置循环';
+  else if (loopActive()) el.textContent = 'A-B 循环中：播放到 B 自动跳回 A · 拖动进度条上的 A/B 圆点可调整 · 点中央播放/暂停';
+  else el.textContent = '顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 拖动进度条上的 A/B 圆点设置循环';
 }
-function paintLoopBar() {
-  if (!duration || !tracks[cur]) { loopBarEl.hidden = true; return; }
-  loopBarEl.hidden = false;
-  const on = loopActive();
-  const pct = ms => Math.max(0, Math.min(100, ms / duration * 100));
-  // 未设置循环时，两个把手停在两端（拖动任意一端即启用）
+function paintBar() {
+  const has = !!tracks[cur] && duration > 0;
+  const on = has && loopActive();
+  const pct = ms => duration > 0 ? Math.max(0, Math.min(100, ms / duration * 100)) : 0;
+  // 整首进度：填充与播放头
+  const f = fracNow();
+  pfillEl.style.width = (f * 100) + '%';
+  pthumbEl.style.left = (f * 100) + '%';
+  // A/B 圆点与循环区间（未设置时停在两端，拖动任一端即启用）
+  hAEl.hidden = !has;
+  hBEl.hidden = !has;
   const pa = pct(on ? loop.a : 0), pb = pct(on ? loop.b : duration);
   hAEl.style.left = pa + '%';
   hBEl.style.left = pb + '%';
   hAEl.classList.toggle('on', on);
   hBEl.classList.toggle('on', on);
-  loopSegEl.hidden = !on;
-  if (on) { loopSegEl.style.left = pa + '%'; loopSegEl.style.width = Math.max(0, pb - pa) + '%'; }
+  psegEl.hidden = !on;
+  if (on) { psegEl.style.left = pa + '%'; psegEl.style.width = Math.max(0, pb - pa) + '%'; }
 }
 function updateLoopUI() {
   const on = loopActive();
@@ -387,7 +402,7 @@ function updateLoopUI() {
   if (on) loopInfoTxt.textContent = 'A ' + fmt(loop.a) + ' → B ' + fmt(loop.b)
     + ' · ' + Math.max(1, Math.round((loop.b - loop.a) / 1000)) + ' 秒';
   updateHint();
-  paintLoopBar();
+  paintBar();
 }
 
 // 每帧检查：播放头到达 B 就跳回 A。拖动时（ring/进度条/把手）不干预。
@@ -405,7 +420,7 @@ function startLoopDrag(which, e) {
   e.stopPropagation();
   if (loop.a == null) loop.a = 0;
   if (loop.b == null) loop.b = duration;
-  const r = loopBarEl.getBoundingClientRect();
+  const r = pbarEl.getBoundingClientRect();
   const t = which === 'a' ? loop.a : loop.b;
   const fraction = t / duration;
   loopDrag = { which, offset: fraction - (r.width ? (e.clientX - r.left) / r.width : fraction) };
@@ -418,7 +433,7 @@ function startLoopDrag(which, e) {
 }
 function moveLoopHandle(clientX) {
   if (!loopDrag || !duration) return;
-  const r = loopBarEl.getBoundingClientRect();
+  const r = pbarEl.getBoundingClientRect();
   if (!r.width) return;
   const p = Math.max(0, Math.min(1, (clientX - r.left) / r.width + loopDrag.offset));
   const t = Math.round(p * duration);   // 取整毫秒，避免 11999.99 被显示成 0:11
@@ -440,12 +455,41 @@ function endLoopDrag() {
 }
 hAEl.addEventListener('pointerdown', (e) => startLoopDrag('a', e));
 hBEl.addEventListener('pointerdown', (e) => startLoopDrag('b', e));
+
+// 进度条主体：点/拖任意位置定位播放头（与 A/B 圆点同一根轴）
+function seekFromClientX(clientX) {
+  if (!duration) return;
+  const r = pbarEl.getBoundingClientRect();
+  if (!r.width) return;
+  const f = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+  dragTarget = f * duration;
+  try { audio.currentTime = dragTarget / 1000; } catch (e) {}
+  paint();
+}
+function endSeekDrag() {
+  if (!seekDrag) return;
+  seekDrag = false;
+  dragging = false;
+  paint();
+  const k = curKey(); if (k) { posMap[k] = audio.currentTime * 1000; LS.set('posMap', posMap); }
+}
+pbarEl.addEventListener('pointerdown', (e) => {
+  if (e.button !== undefined && e.button !== 0) return;
+  if (!tracks[cur] || !duration) return;
+  e.preventDefault();
+  seekDrag = true;
+  dragging = true;
+  try { if (pbarEl.setPointerCapture) pbarEl.setPointerCapture(e.pointerId); } catch (err) {}
+  seekFromClientX(e.clientX);
+});
+
 // 移动/抬起挂在 window 上，和圆环拖动同一套路，Safari 更稳
 window.addEventListener('pointermove', (e) => {
   if (loopDrag) { e.preventDefault(); moveLoopHandle(e.clientX); }
+  else if (seekDrag) { e.preventDefault(); seekFromClientX(e.clientX); }
 }, { passive: false });
-window.addEventListener('pointerup', () => endLoopDrag());
-window.addEventListener('pointercancel', () => endLoopDrag());
+window.addEventListener('pointerup', () => { endLoopDrag(); endSeekDrag(); });
+window.addEventListener('pointercancel', () => { endLoopDrag(); endSeekDrag(); });
 loopClearBtn.addEventListener('click', () => {
   loop.a = null; loop.b = null;
   saveLoop(); updateLoopUI(); paint();
