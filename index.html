@@ -15,6 +15,7 @@
     --txt:#e9e7ee; --sub:#b9b4c2; --accent:#E9EDF2; --track:#9AA1AB; --err:#ffb4ab;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  [hidden]{display:none!important}
   html,body{margin:0;height:100%}
   body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Roboto,sans-serif;overflow:hidden}
   #app{height:100%;max-width:520px;margin:0 auto;display:flex;flex-direction:column;padding:max(12px,env(safe-area-inset-top)) 16px calc(10px + env(safe-area-inset-bottom));position:relative}
@@ -52,10 +53,22 @@
   #timeRow{display:flex;justify-content:space-between;font-size:16px;color:var(--sub);font-variant-numeric:tabular-nums;margin-top:2px}
   #cur{color:var(--accent);font-weight:600}
   #seek{width:100%;accent-color:var(--accent);margin:2px 0 6px}
+  /* A-B 循环区间条：两端圆点可直接拖动；中间高亮段 = 循环区间 */
+  #loopBar{position:relative;height:30px;margin:-2px 0 2px;touch-action:none;user-select:none;-webkit-user-select:none}
+  #loopBar::before{content:'';position:absolute;left:0;right:0;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.14)}
+  #loopSeg{position:absolute;top:50%;height:6px;margin-top:-3px;border-radius:3px;background:rgba(233,237,242,.45);pointer-events:none}
+  .loopHandle{position:absolute;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;
+    border:2px solid var(--track);background:var(--bg);color:var(--sub);font-size:10px;font-weight:700;font-style:normal;
+    display:flex;align-items:center;justify-content:center;touch-action:none;cursor:grab;z-index:1}
+  .loopHandle::after{content:'';position:absolute;inset:-12px;border-radius:50%}  /* 扩大触控范围 */
+  .loopHandle.on{border-color:var(--accent);background:var(--accent);color:#121016}
+  #loopInfo{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--sub);margin:0 0 4px;font-variant-numeric:tabular-nums}
+  #loopInfo #loopInfoTxt{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #loopInfo .btn{height:24px;padding:0 10px;font-size:12px}
   #hint{text-align:center;font-size:12px;color:var(--sub);margin-bottom:8px}
   #tracksHead{display:flex;align-items:center;justify-content:space-between;font-size:13px;color:var(--sub)}
-  #list{list-style:none;margin:6px 0 0;padding:0;overflow-y:auto;max-height:26vh}
-  #list li{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px}
+  #list{list-style:none;margin:6px 0 0;padding:0;overflow-y:auto;max-height:170px;-webkit-overflow-scrolling:touch}
+  #list li{display:flex;align-items:center;gap:8px;height:34px;padding:7px 8px;border-radius:8px}
   #list li.current{background:var(--surface2)}
   #list li .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}
   #list li button{flex:none;border:0;background:transparent;color:var(--sub);font-size:13px;padding:2px 6px;border-radius:6px}
@@ -144,6 +157,15 @@
   <div id="subline"></div>
   <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   <input type="range" id="seek" min="0" max="1000" value="0">
+  <div id="loopBar" hidden>
+    <div id="loopSeg" hidden></div>
+    <div class="loopHandle" id="hA" role="slider" aria-label="循环起点 A">A</div>
+    <div class="loopHandle" id="hB" role="slider" aria-label="循环终点 B">B</div>
+  </div>
+  <div id="loopInfo" hidden>
+    <span id="loopInfoTxt"></span>
+    <button class="btn" id="loopClear">关闭循环</button>
+  </div>
   <div id="hint">顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 播完自动重播</div>
 
   <div id="tracksHead"><span>我的歌曲</span><button class="btn" id="btnAddMore" style="height:26px;padding:0 8px">+ 添加</button></div>
@@ -182,6 +204,10 @@ let secondsPerTurn = LS.get('spt', 30);
 const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 let rate = LS.get('rate', 1);
 let posMap = LS.get('posMap', {});
+// 每首歌各自的 A-B 循环区间（毫秒）：{ key: {a,b} }。切歌时带出该曲自己的区间。
+let loopMap = LS.get('loopMap', {});
+const loop = { a: null, b: null };     // 当前曲目的循环端点；null = 未设置/未启用
+const LOOP_MIN_MS = 1000;              // A、B 之间至少留 1 秒
 const curKey = () => (cur >= 0 && tracks[cur]) ? tracks[cur].key : null;
 
 /* ============ IndexedDB：记住选过的几首歌 ============ */
@@ -306,10 +332,124 @@ function paint() {
   durEl.textContent = fmt(duration);
   seekEl.value = Math.round(f * 1000);
   subSyncLine(dragging ? dragTarget : audio.currentTime * 1000);
+  paintLoopBar();
 }
-function rafLoop() { paint(); rafId = requestAnimationFrame(rafLoop); }
+function rafLoop() { loopTick(); paint(); rafId = requestAnimationFrame(rafLoop); }
 function startLoop() { if (!rafId) rafId = requestAnimationFrame(rafLoop); }
 function stopLoop() { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } }
+
+/* ============ A-B 循环：区间条拖拽 ============ */
+const loopBarEl = A('loopBar'), loopSegEl = A('loopSeg'), hAEl = A('hA'), hBEl = A('hB'),
+      loopInfoEl = A('loopInfo'), loopInfoTxt = A('loopInfoTxt'), loopClearBtn = A('loopClear');
+let loopDrag = null;   // { which:'a'|'b', offset: 按住点相对把手的偏移（0..1 的比例） }
+
+function loopActive() { return loop.a != null && loop.b != null && loop.b - loop.a >= LOOP_MIN_MS; }
+
+function loadLoopFor(key) {
+  const l = key ? loopMap[key] : null;
+  loop.a = l && l.a != null ? l.a : null;
+  loop.b = l && l.b != null ? l.b : null;
+}
+function saveLoop() {
+  const k = curKey();
+  if (k) {
+    if (loop.a == null && loop.b == null) delete loopMap[k];
+    else loopMap[k] = { a: Math.round(loop.a), b: Math.round(loop.b) };
+    LS.set('loopMap', loopMap);
+  }
+  // A-B 生效时由 loopTick 负责跳回 A（这样 B 落在曲尾也能回到 A）；否则保持整曲循环
+  audio.loop = !loopActive();
+}
+function updateHint() {
+  const el = A('hint');
+  if (!tracks[cur]) el.textContent = '顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 播完自动重播';
+  else if (loopActive()) el.textContent = 'A-B 循环中：播放到 B 自动跳回 A · 拖动下方 A/B 圆点可调整 · 点中央播放/暂停';
+  else el.textContent = '顺时针滑动圆环：快进 · 逆时针：后退 · 点中央：播放/暂停 · 拖动下方 A/B 圆点设置循环';
+}
+function paintLoopBar() {
+  if (!duration || !tracks[cur]) { loopBarEl.hidden = true; return; }
+  loopBarEl.hidden = false;
+  const on = loopActive();
+  const pct = ms => Math.max(0, Math.min(100, ms / duration * 100));
+  // 未设置循环时，两个把手停在两端（拖动任意一端即启用）
+  const pa = pct(on ? loop.a : 0), pb = pct(on ? loop.b : duration);
+  hAEl.style.left = pa + '%';
+  hBEl.style.left = pb + '%';
+  hAEl.classList.toggle('on', on);
+  hBEl.classList.toggle('on', on);
+  loopSegEl.hidden = !on;
+  if (on) { loopSegEl.style.left = pa + '%'; loopSegEl.style.width = Math.max(0, pb - pa) + '%'; }
+}
+function updateLoopUI() {
+  const on = loopActive();
+  const hasTrack = !!tracks[cur] && duration > 0;
+  loopInfoEl.hidden = !on || !hasTrack;
+  if (on) loopInfoTxt.textContent = 'A ' + fmt(loop.a) + ' → B ' + fmt(loop.b)
+    + ' · ' + Math.max(1, Math.round((loop.b - loop.a) / 1000)) + ' 秒';
+  updateHint();
+  paintLoopBar();
+}
+
+// 每帧检查：播放头到达 B 就跳回 A。拖动时（ring/进度条/把手）不干预。
+function loopTick() {
+  if (!loopActive() || dragging || audio.paused) return;
+  if (audio.currentTime * 1000 >= loop.b) {
+    try { audio.currentTime = loop.a / 1000; } catch (e) {}
+    const k = curKey(); if (k) { posMap[k] = loop.a; LS.set('posMap', posMap); }
+  }
+}
+
+function startLoopDrag(which, e) {
+  if (!tracks[cur] || !duration) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (loop.a == null) loop.a = 0;
+  if (loop.b == null) loop.b = duration;
+  const r = loopBarEl.getBoundingClientRect();
+  const t = which === 'a' ? loop.a : loop.b;
+  const fraction = t / duration;
+  loopDrag = { which, offset: fraction - (r.width ? (e.clientX - r.left) / r.width : fraction) };
+  audio.loop = false;                 // 一旦拖动即进入 A-B 循环
+  if (!audio.paused) { audio.pause(); setPlaying(false); }   // 调整时先停住，避免与循环跳转抢播放头
+  dragging = true;                    // 抑制 loopTick，同时让进度显示跟随把手
+  dragTarget = t;
+  try { if (e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+  moveLoopHandle(e.clientX);
+}
+function moveLoopHandle(clientX) {
+  if (!loopDrag || !duration) return;
+  const r = loopBarEl.getBoundingClientRect();
+  if (!r.width) return;
+  const p = Math.max(0, Math.min(1, (clientX - r.left) / r.width + loopDrag.offset));
+  const t = Math.round(p * duration);   // 取整毫秒，避免 11999.99 被显示成 0:11
+  if (loopDrag.which === 'a') loop.a = Math.max(0, Math.min(t, loop.b - LOOP_MIN_MS));
+  else loop.b = Math.min(duration, Math.max(t, loop.a + LOOP_MIN_MS));
+  dragTarget = loopDrag.which === 'a' ? loop.a : loop.b;
+  try { audio.currentTime = dragTarget / 1000; } catch (e) {}   // 边拖边听：播放头跟到把手位置
+  updateLoopUI();
+  paint();
+}
+function endLoopDrag() {
+  if (!loopDrag) return;
+  loopDrag = null;
+  dragging = false;
+  saveLoop();
+  updateLoopUI();
+  paint();
+  const k = curKey(); if (k) { posMap[k] = audio.currentTime * 1000; LS.set('posMap', posMap); }
+}
+hAEl.addEventListener('pointerdown', (e) => startLoopDrag('a', e));
+hBEl.addEventListener('pointerdown', (e) => startLoopDrag('b', e));
+// 移动/抬起挂在 window 上，和圆环拖动同一套路，Safari 更稳
+window.addEventListener('pointermove', (e) => {
+  if (loopDrag) { e.preventDefault(); moveLoopHandle(e.clientX); }
+}, { passive: false });
+window.addEventListener('pointerup', () => endLoopDrag());
+window.addEventListener('pointercancel', () => endLoopDrag());
+loopClearBtn.addEventListener('click', () => {
+  loop.a = null; loop.b = null;
+  saveLoop(); updateLoopUI(); paint();
+});
 
 /* ============ 播放核心 ============ */
 function setPlaying(playing) {
@@ -324,7 +464,7 @@ function playCurrent() {
   if (!t.url) t.url = URL.createObjectURL(t.blob);
   audio.src = t.url;
   duration = 0;
-  audio.loop = true;                  // 单曲无限循环：播完自动从头再播
+  audio.loop = !loopActive();         // 默认整曲循环；A-B 生效时交给 loopTick 跳回 A
   audio.defaultPlaybackRate = rate;   // 换 src 会重置倍速为 1，这里重新应用
   audio.playbackRate = rate;
   const pos = posMap[t.key] || 0;
@@ -333,12 +473,17 @@ function playCurrent() {
     duration = audio.duration * 1000;
     audio.playbackRate = rate;
     if (pos > 0 && pos < duration) { try { audio.currentTime = pos / 1000; } catch (e) {} }
+    // 区间若是旧文件留下的，超出新时长时收回边界
+    if (loop.b != null) loop.b = Math.min(loop.b, duration);
+    if (loop.a != null) loop.a = Math.min(loop.a, Math.max(0, loop.b != null ? loop.b - LOOP_MIN_MS : duration - LOOP_MIN_MS));
     subEl.textContent = '已就绪';
+    updateLoopUI();     // 时长到了，区间条/把手才可以显示和拖动
     renderSubPanel();   // 元数据到了，刷新面板（"这段约需多久"要靠时长才算得出来）
   };
   audio.onerror = () => setErr('无法播放该文件');
   audio.ontimeupdate = () => {
     if (!dragging) {
+      loopTick();     // 后台标签页里 RAF 会被节流，这里兜底
       if (Math.random() < 0.15) { posMap[t.key] = audio.currentTime * 1000; LS.set('posMap', posMap); }
       paint();
     }
@@ -346,16 +491,25 @@ function playCurrent() {
   // 不自动播放，等用户点中央（符合浏览器自动播放策略）
 }
 
+// B 恰好落在曲尾、先触发 ended 时，也从 A 接着放（A-B 生效时 audio.loop 是关闭的）
+audio.addEventListener('ended', () => {
+  if (!loopActive() || cur < 0) return;
+  try { audio.currentTime = loop.a / 1000; } catch (e) {}
+  const pr = audio.play(); if (pr && pr.catch) pr.catch(() => {});
+});
+
 function selectTrack(i, autoplay) {
   if (i === cur) { if (autoplay) toggle(); return; }
   cur = i; dragging = false;
   audio.pause();
   revoke(tracks[cur]);          // 上一首的 url 可复用给当前，安全起见重新生成
   const keep = tracks[i]; keep.url = null;
+  loadLoopFor(keep.key);        // 每首歌带出自己的 A-B 区间
   titleEl.textContent = keep.name;
   playCurrent();
   renderList();
   subOnTrackChanged();
+  updateLoopUI();
   if (autoplay) toggle();
   else subEl.textContent = '点击中央开始播放';
 }
@@ -363,6 +517,11 @@ function selectTrack(i, autoplay) {
 function toggle() {
   if (cur < 0) { openFiles(); return; }
   if (audio.paused) {
+    // A-B 生效时若播放头在区间外，从 A 开始
+    if (loopActive()) {
+      const t = audio.currentTime * 1000;
+      if (t < loop.a || t >= loop.b) { try { audio.currentTime = loop.a / 1000; } catch (e) {} }
+    }
     const pr = audio.play();
     if (pr && pr.catch) pr.catch(() => setErr('需再点一次播放（浏览器自动播放限制）'));
     setPlaying(true);
@@ -405,7 +564,11 @@ function renderList() {
     play.addEventListener('click', () => selectTrack(i, true));
     del.addEventListener('click', async () => {
       const k = t.key;
-      if (k) { posMap[k] = 0; LS.set('posMap', posMap); if (db) await dbDelete(k); }
+      if (k) {
+        posMap[k] = 0; LS.set('posMap', posMap);
+        delete loopMap[k]; LS.set('loopMap', loopMap);   // 连同这首歌的 A-B 区间一起删掉
+        if (db) await dbDelete(k);
+      }
       revoke(t);
       const wasCur = i === cur;
       tracks.splice(i, 1);
@@ -414,6 +577,8 @@ function renderList() {
       // 这一句是必须的：上面 selectTrack(cur,false) 的参数就是 cur，会提前 return，不会触发
       // subOnTrackChanged()，只有这里能清掉刚被删掉那首歌残留的字幕
       if (wasCur) { subOnTrackChanged(); }
+      if (wasCur) loadLoopFor(cur >= 0 && tracks[cur] ? tracks[cur].key : null);
+      updateLoopUI();
       renderList();
     });
     li.appendChild(nm); li.appendChild(play); li.appendChild(del);
@@ -1486,6 +1651,7 @@ A('subTxt').addEventListener('click', () => subExport('txt'));
 var jsOk = document.getElementById('jsok');
 if (jsOk) jsOk.style.display = 'block';   // 只要这段能跑，就显示“JS 运行中”，便于排查
 syncSensUI();
+updateLoopUI();     // 首屏：无曲目时隐藏区间条，并写好提示行
 startLoop();
 loadStored();
 sizeDial();
