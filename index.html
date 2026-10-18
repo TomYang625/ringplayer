@@ -128,20 +128,27 @@
         <button class="btn" id="subStop" style="height:28px;padding:0 8px" hidden>停止</button>
         <button class="btn" id="subDel" style="height:28px;padding:0 8px" hidden>删除</button>
       </div>
+      <div class="row" id="subLangRow">
+        <span style="font-size:13px;white-space:nowrap">语言</span>
+        <select id="subLang" style="flex:1">
+          <option value="en">英语 · English</option>
+          <option value="ar">阿拉伯语 · العربية</option>
+        </select>
+      </div>
       <div class="row" id="subModelRow">
         <span style="font-size:13px;white-space:nowrap">模型</span>
         <select id="subModel" style="flex:1">
-          <option value="tiny">tiny.en · 39MB · 最快</option>
-          <option value="base">base.en · q4 · 更准</option>
-          <option value="small">small.en · 238MB · 最准</option>
+          <option value="tiny">tiny · 39MB · 最快</option>
+          <option value="base">base · q4 · 136MB · 更准</option>
+          <option value="small">small · q4 · 285MB · 最准</option>
         </select>
       </div>
       <div class="row" id="subExportRow" hidden>
         <button class="btn" id="subSrt" style="height:28px;padding:0 8px">导出 .srt</button>
         <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
       </div>
-      <small id="subHint">首次使用会从镜像下载模型并缓存在本机；之后离线可用。转写时请保持屏幕常亮。
-        iPad 上 base.en 使用 q4 量化并按 60 秒流式取样；tiny.en 更快，small.en 不建议使用。</small>
+      <small id="subHint">支持英语与阿拉伯语。首次使用会从镜像下载模型并缓存在本机；之后离线可用。
+        转写时请保持屏幕常亮。iPad 上按 60 秒流式取样；tiny 更快，small 不建议使用。</small>
       <div id="subList"></div>
     </div>
 
@@ -158,7 +165,7 @@
     </div>
   </div>
 
-  <div id="subline"></div>
+  <div id="subline" dir="auto"></div>
   <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   <div id="pbarWrap">
     <input type="range" id="seek" min="0" max="1000" value="0" aria-label="播放进度">
@@ -748,12 +755,28 @@ rateReset.addEventListener('click', () => applyRate(1));
 syncRateUI();
 
 /* ============ 字幕：生成 ============ */
-const SUB_MODELS = {
-  tiny:  { id: 'onnx-community/whisper-tiny.en',  dtype: 'q8', mb: 39  },
-  base:  { id: 'onnx-community/whisper-base.en',  dtype: 'q4', mb: 73  },
-  small: { id: 'onnx-community/whisper-small.en', dtype: 'q4', mb: 238 },
+// 每种语言一套模型。英语用 .en 专用模型（更快更准）；阿拉伯语用多语模型，
+// 生成时需传 language='ar'（.en 模型不接受 language/task，会把任务直接报错）。
+const SUB_MODELS_BY_LANG = {
+  en: {
+    tiny:  { id: 'onnx-community/whisper-tiny.en',  dtype: 'q8', mb: 39  },
+    base:  { id: 'onnx-community/whisper-base.en',  dtype: 'q4', mb: 136 },
+    small: { id: 'onnx-community/whisper-small.en', dtype: 'q4', mb: 285 },
+  },
+  ar: {
+    tiny:  { id: 'onnx-community/whisper-tiny',  dtype: 'q8', mb: 39  },
+    base:  { id: 'onnx-community/whisper-base',  dtype: 'q4', mb: 136 },
+    small: { id: 'onnx-community/whisper-small', dtype: 'q4', mb: 285 },
+  },
 };
-// 桌面浏览器和 iPad 都默认 base.en；iPad 走 q4 + 流式取样，避免模型和整首音频
+const SUB_LANG_NAME = { en: '英文', ar: '阿拉伯语' };
+let SUB_LANG = LS.get('subLang', 'en');
+if (!SUB_MODELS_BY_LANG[SUB_LANG]) SUB_LANG = 'en';
+let SUB_MODELS = SUB_MODELS_BY_LANG[SUB_LANG];
+// 字幕按「歌曲 + 语言」分开存：英文沿用旧 key（兼容已有数据），阿拉伯语加后缀
+function subKey(key) { return SUB_LANG === 'en' ? key : key + '|' + SUB_LANG; }
+
+// 桌面浏览器和 iPad 都默认 base；iPad 走 q4 + 流式取样，避免模型和整首音频
 // 同时占用大量内存。small 仍不建议在移动 WebKit 上使用。
 const savedSubModel = LS.get('subModel', null);
 const SUB_LS_BASE_DISABLED = 'subBaseDisabled';
@@ -772,7 +795,6 @@ function subRunMark(stage) {
         elapsedSec: Math.round((Date.now() - sub.t0) / 1000), at: Date.now() }); } catch (e) {}
 }
 function subRunClear() { try { localStorage.removeItem(SUB_LS_RUN); } catch (e) {} }
-const SUB_LANG = 'en';
 const SUB_MAX_SEC = isBareWebKit() ? 10 * 60 : 30 * 60;
 const SUB_MAX_SEC_LABEL = isBareWebKit() ? '10 分钟' : '30 分钟';
 // 分段转写的段长（秒）。段越短：进度越细、崩溃损失越小，但段间接缝越多（接缝处可能丢一个词）。
@@ -1084,18 +1106,38 @@ function isBareWebKit() {
   return /AppleWebKit/.test(ua) && !/(Chrome\/|Chromium\/|Edg\/|OPR\/|SamsungBrowser)/.test(ua);
 }
 
+// 按当前语言刷新模型下拉项的说明（模型 id/体积随语言变化）
+function syncSubModelOptions() {
+  const sel = A('subModel');
+  const m = SUB_MODELS;
+  const text = {
+    tiny: 'tiny · ' + m.tiny.mb + 'MB · 最快',
+    base: 'base · q4 · ' + m.base.mb + 'MB · 更准',
+    small: 'small · q4 · ' + m.small.mb + 'MB · 最准',
+  };
+  for (const option of sel.options) if (text[option.value]) option.textContent = text[option.value];
+  sel.value = subModel;
+  A('subLang').value = SUB_LANG;
+}
+
 function applySubModelLimits() {
   const select = A('subModel');
-  if (!isBareWebKit()) return;
+  const hint = A('subHint');
+  const arNote = SUB_LANG === 'ar' ? '阿拉伯语建议选 base 或 small（更准），tiny 更快但准确率较低。' : '';
+  if (!isBareWebKit()) {
+    hint.textContent = '支持英语与阿拉伯语。首次使用会从镜像下载模型并缓存在本机；之后离线可用。'
+      + '转写时请保持屏幕常亮。' + arNote;
+    return;
+  }
   const baseDisabled = !!LS.get(SUB_LS_BASE_DISABLED, false);
   for (const option of select.options) {
     option.disabled = option.value === 'small' || (baseDisabled && option.value === 'base');
   }
   select.value = subModel;
-  const hint = A('subHint');
-  hint.textContent = baseDisabled
-    ? '这台设备上次使用 base.en 时页面被系统回收，已自动停用 base；请使用 tiny.en，或改在电脑/原生 App 上生成字幕。'
-    : 'iPad/iPhone 使用流式取样；base.en 使用 q4 量化并按 60 秒分段，避免整首音频与模型同时占用内存。small.en 已禁用；转写时请保持屏幕常亮。';
+  hint.textContent = (baseDisabled
+    ? '这台设备上次使用 base 档时页面被系统回收，已自动停用 base；请使用 tiny 档，或改在电脑/原生 App 上生成字幕。'
+    : 'iPad/iPhone 使用流式取样；base 使用 q4 量化并按 60 秒分段，避免整首音频与模型同时占用内存。small 已禁用；转写时请保持屏幕常亮。')
+    + (arNote ? ' ' + arNote : '');
 }
 
 function asrUnsupportedOS() {
@@ -1361,7 +1403,7 @@ async function subStart() {
     return;
   }
   getDecodeCtx();   // 必须在用户手势任务内（此刻还没有任何 await）把音频上下文建出来，iOS 才认
-  const key = t.key;
+  const key = subKey(t.key);
   const job = ++subJob;
   subClearTimer();
   cancelAsrJob();     // 保证任何时刻只有一条 Whisper 管线在跑（上一轮没跑完就先掐掉）
@@ -1561,6 +1603,7 @@ function renderSubPanel() {
   A('subModelRow').hidden = !!sub.rec;
   A('subExportRow').hidden = sub.state !== 'done';
   A('subModel').value = subModel;
+  A('subLang').value = SUB_LANG;
   start.textContent = sub.state === 'error' ? '重新生成' : '生成字幕';
   if (!tracks[cur]) st.textContent = '先选一首歌，再生成字幕';
   else if (sub.state === 'none') st.textContent = '字幕';
@@ -1569,7 +1612,7 @@ function renderSubPanel() {
     const rate = (LS.get(SUB_LS_SPEED, {}) || {})[SUB_MODELS[subModel].id];
     const dur = isFinite(audio.duration) ? audio.duration : 0;
     const est = (rate && dur) ? '，本机约 ' + rate.toFixed(1) + ' 倍速，这段约需 ' + fmtElapsed(dur / rate) : '';
-    st.textContent = '生成字幕（英文 · 首次下载约 ' + SUB_MODELS[subModel].mb + 'MB）' + est;
+    st.textContent = '生成字幕（' + SUB_LANG_NAME[SUB_LANG] + ' · 首次下载约 ' + SUB_MODELS[subModel].mb + 'MB）' + est;
   }
   else if (sub.state === 'running') {
     // 三个阶段都带上"已用时长"：实时可见，用户就不必猜它是不是卡住了
@@ -1603,8 +1646,9 @@ function renderSubPanel() {
         + (Date.now() - sub.lastAt > 30000 ? '——已 30 秒无下载进展，可点「停止」后重试' : '');
     }
   }
-  else if (sub.state === 'done') st.textContent = '字幕已生成（' + sub.rec.chunks.length + ' 句'
-      + (sub.device ? ' · ' + sub.device : '') + '）' + (sub.warn ? '，但' + sub.warn : '');
+  else if (sub.state === 'done') st.textContent = '字幕已生成（' + SUB_LANG_NAME[SUB_LANG] + ' · '
+      + sub.rec.chunks.length + ' 句' + (sub.device ? ' · ' + sub.device : '') + '）'
+      + (sub.warn ? '，但' + sub.warn : '');
   else st.textContent = sub.err || '失败';
   // 「上次生成在哪一步中断」的提示：挂在任何状态后面显示，直到用户再点一次生成
   if (sub.crash) st.textContent += ' · ' + sub.crash;
@@ -1621,6 +1665,7 @@ function renderSubList() {
   sub.rec.chunks.forEach((c, i) => {
     const d = document.createElement('div');
     d.className = 'row'; d.dataset.i = i; d.textContent = c.text;
+    d.dir = 'auto';   // 阿拉伯语等 RTL 文本按内容方向排版
     d.addEventListener('click', () => { audio.currentTime = c.s; paint(); });
     subListEl.appendChild(d);
   });
@@ -1635,7 +1680,7 @@ function subOnTrackChanged() {
   subLineEl.textContent = ''; subLineEl.classList.remove('on');
   renderSubList(); renderSubPanel();
   const k = curKey(); if (!k) return;
-  subGet(k).then(r => {
+  subGet(subKey(k)).then(r => {
     if (r && r.partial && r.doneSeg > 0 && r.segSec === SUB_SEG_SEC) {
       // 上次转到一半被打断：先把已有的显示出来，并说明"再点一次生成会接着转"
       sub.rec = r; sub.state = 'ready';
@@ -1659,7 +1704,7 @@ A('btnSub').addEventListener('click', () => showPanel(subPanel.hidden ? 'sub' : 
 A('subStart').addEventListener('click', subStart);
 A('subStop').addEventListener('click', subStop);
 A('subDel').addEventListener('click', async () => {
-  const k = curKey(); if (k) await subDelete(k);
+  const k = curKey(); if (k) await subDelete(subKey(k));
   sub.rec = null; sub.state = 'ready'; renderSubList(); renderSubPanel(); subSyncLine(0, true);
 });
 A('subModel').addEventListener('change', () => {
@@ -1667,6 +1712,16 @@ A('subModel').addEventListener('change', () => {
   A('subModel').value = subModel;
   LS.set('subModel', subModel);
   renderSubPanel();
+});
+// 切换字幕语言：换一套模型，并载入该语言已存的字幕（正在跑的任务会先被掐掉）
+A('subLang').addEventListener('change', () => {
+  const v = A('subLang').value;
+  SUB_LANG = SUB_MODELS_BY_LANG[v] ? v : 'en';
+  SUB_MODELS = SUB_MODELS_BY_LANG[SUB_LANG];
+  LS.set('subLang', SUB_LANG);
+  syncSubModelOptions();
+  applySubModelLimits();
+  subOnTrackChanged();
 });
 
 /* ============ 字幕：导出 ============ */
@@ -1711,6 +1766,7 @@ if ('serviceWorker' in navigator &&
 }
 
 renderSubPanel();   // 首屏就按当前状态渲染（无曲目时提示先选歌；有曲目时 loadStored→subOnTrackChanged 会再渲染一次）
+syncSubModelOptions();   // 模型下拉的尺寸/名称按当前语言写
 applySubModelLimits();
 
 // 上次生成若在「准备模型/转写中」阶段留下了记录却没有被清掉，说明页面是在那时被浏览器干掉的
@@ -1732,10 +1788,10 @@ applySubModelLimits();
   const crashedTier = Object.keys(SUB_MODELS).find((k) => SUB_MODELS[k].id === last.model);
   if (crashedTier && crashedTier !== 'tiny') {
     subModel = 'tiny'; LS.set('subModel', 'tiny');
-    extra.push('已自动改用更省内存的 tiny.en 档');
+    extra.push('已自动改用更省内存的 tiny 档');
     if (isBareWebKit() && crashedTier === 'base') {
       LS.set(SUB_LS_BASE_DISABLED, true);
-      extra.push('本机已停用 base.en，避免再次崩溃');
+      extra.push('本机已停用 base 档，避免再次崩溃');
     }
   } else if (last.device === 'wasm') {
     extra.push('多半是内存吃紧：可先用更短的音频，或在电脑上预生成字幕再导入');
