@@ -79,10 +79,14 @@
   #list li button:hover{background:var(--surface2)}
   #fileInput{display:none}
   #subline{display:none;text-align:center;font-size:18px;line-height:1.35;color:var(--accent);margin:8px 2px 0;overflow:hidden;min-height:0}
-  #subline.on{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  #subline.on{display:block}
+  #subline .l{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  #subline .zh{font-size:15px;color:var(--sub);margin-top:2px}
+  #subline .zh:empty{display:none}
   #subList{max-height:30vh;overflow-y:auto;margin-top:6px;font-size:16px}
-  #subList .row{padding:7px 8px;border-radius:8px;cursor:pointer;color:var(--sub)}
+  #subList .row{display:block;padding:7px 8px;border-radius:8px;cursor:pointer;color:var(--sub)}
   #subList .row.on{background:var(--surface2);color:var(--txt);font-weight:600}
+  #subList .trans{font-size:13px;color:var(--sub);font-weight:400;margin-top:2px}
 </style>
 </head>
 <body>
@@ -127,6 +131,7 @@
         <button class="btn" id="subStart" style="height:28px;padding:0 8px">生成字幕</button>
         <button class="btn" id="subStop" style="height:28px;padding:0 8px" hidden>停止</button>
         <button class="btn" id="subDel" style="height:28px;padding:0 8px" hidden>删除</button>
+        <button class="btn" id="subTransZh" style="height:28px;padding:0 8px" hidden>翻译中文</button>
       </div>
       <div class="row" id="subLangRow">
         <span style="font-size:13px;white-space:nowrap">语言</span>
@@ -143,12 +148,21 @@
           <option value="small">small · q4 · 285MB · 最准</option>
         </select>
       </div>
+      <div class="row" id="subZhRow">
+        <label for="subZh" style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="subZh" style="accent-color:var(--accent)">
+          中文翻译 <small id="subZhNote" style="font-size:12px"></small>
+        </label>
+      </div>
       <div class="row" id="subExportRow" hidden>
         <button class="btn" id="subSrt" style="height:28px;padding:0 8px">导出 .srt</button>
         <button class="btn" id="subTxt" style="height:28px;padding:0 8px">导出 .txt</button>
+        <button class="btn" id="subSrtZh" style="height:28px;padding:0 8px" hidden>中文 .srt</button>
+        <button class="btn" id="subTxtZh" style="height:28px;padding:0 8px" hidden>中文 .txt</button>
       </div>
       <small id="subHint">支持英语与阿拉伯语。首次使用会从镜像下载模型并缓存在本机；之后离线可用。
-        转写时请保持屏幕常亮。iPad 上按 60 秒流式取样；tiny 更快，small 不建议使用。</small>
+        转写时请保持屏幕常亮。iPad 上按 60 秒流式取样；tiny 更快，small 不建议使用。
+        勾选「中文翻译」会在本地一并生成中文（英语直译，阿拉伯语经英文中转）。</small>
       <div id="subList"></div>
     </div>
 
@@ -165,7 +179,7 @@
     </div>
   </div>
 
-  <div id="subline" dir="auto"></div>
+  <div id="subline" dir="auto"><div class="l" id="subOrig" dir="auto"></div><div class="l zh" id="subZhLine" dir="auto"></div></div>
   <div id="timeRow"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   <div id="pbarWrap">
     <input type="range" id="seek" min="0" max="1000" value="0" aria-label="播放进度">
@@ -776,6 +790,14 @@ let SUB_MODELS = SUB_MODELS_BY_LANG[SUB_LANG];
 // 字幕按「歌曲 + 语言」分开存：英文沿用旧 key（兼容已有数据），阿拉伯语加后缀
 function subKey(key) { return SUB_LANG === 'en' ? key : key + '|' + SUB_LANG; }
 
+// 中文翻译模型（本地 OPUS-MT）：英语直译；阿拉伯语没有 ar-zh 模型，经英文中转。
+const SUB_ZH_MODELS = {
+  en: [{ model: 'Xenova/opus-mt-en-zh', dtype: 'q8', mb: 108 }],
+  ar: [{ model: 'Xenova/opus-mt-ar-en', dtype: 'q8', mb: 106 },
+       { model: 'Xenova/opus-mt-en-zh', dtype: 'q8', mb: 108 }],
+};
+let subZhOn = LS.get('subZh', false) === true;
+
 // 桌面浏览器和 iPad 都默认 base；iPad 走 q4 + 流式取样，避免模型和整首音频
 // 同时占用大量内存。small 仍不建议在移动 WebKit 上使用。
 const savedSubModel = LS.get('subModel', null);
@@ -810,7 +832,8 @@ const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
 function subUserErr(msg) { const e = new Error(msg); e.__userFacing = true; return e; }
 
 const sub = { state: 'none', rec: null, phase: 'decode', dlPct: 0, dlLoaded: 0, dlTotal: 0,
-              device: '', booted: false, lastAt: 0, t0: 0, totalSec: 0, err: '', warn: '' };
+              device: '', booted: false, lastAt: 0, t0: 0, totalSec: 0, err: '', warn: '',
+              trReady: false, trDone: 0, trTotal: 0, trStep: 0, trStepN: 0 };
 let subJob = 0;            // 每次启动 +1，用来丢弃过期消息
 let subTimer = null;
 
@@ -977,6 +1000,152 @@ function cancelAsrJob() {
   // 否则那个 await 永不结算，subStart 的 async 帧（连同 samples 和解码后的音频）就退不掉。
   if (c) { try { c(); } catch (e) {} }
   if (subWorker) { try { subWorker.terminate(); } catch (e) {} subWorker = null; }
+  cancelMtJob();     // 翻译 worker 也一并掐掉（停止/换歌/换语言）
+}
+
+/* ============ 字幕：中文翻译（本地 OPUS-MT） ============ */
+const MT_WORKER_SRC = `
+let pipe = null;
+self.onmessage = async (e) => {
+  const d = e.data;
+  try {
+    if (d.type === 'load') {
+      self.postMessage({ type:'boot' });
+      const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1');
+      const { pipeline, env } = mod;
+      env.remoteHost = 'https://hf-mirror.com';
+      env.allowLocalModels = false;
+      pipe = await pipeline('translation', d.model, {
+        dtype: d.dtype || 'q8',
+        device: 'wasm',
+        progress_callback: (x) => {
+          if (x.status === 'progress' && x.loaded)
+            self.postMessage({ type:'download', loaded: x.loaded, total: x.total || 0, file: x.file || '' });
+        },
+      });
+      self.postMessage({ type:'ready' });
+      return;
+    }
+    if (d.type === 'texts') {
+      if (!pipe) throw new Error('翻译器尚未准备好');
+      const out = [];
+      for (let i = 0; i < d.texts.length; i++) {
+        const res = await pipe(d.texts[i]);
+        const r = Array.isArray(res) ? res[0] : res;
+        out.push(((r && r.translation_text) || '').trim());
+        self.postMessage({ type:'progress', i: i + 1, n: d.texts.length });
+      }
+      self.postMessage({ type:'done', texts: out });
+      return;
+    }
+  } catch (err) {
+    self.postMessage({ type:'err', text: String((err && err.message) || err) });
+  }
+};
+`;
+function createMtWorker() {
+  return new Worker(URL.createObjectURL(new Blob([MT_WORKER_SRC], { type: 'text/javascript' })), { type: 'module' });
+}
+let mtWorker = null;
+let mtWorkerCancel = null;
+function cancelMtJob() {
+  const c = mtWorkerCancel; mtWorkerCancel = null;
+  if (c) { try { c(); } catch (e) {} }
+  if (mtWorker) { try { mtWorker.terminate(); } catch (e) {} mtWorker = null; }
+}
+
+// 跑一个翻译模型；取消时 terminate，避免模型在后台继续占内存
+async function runMtModel(texts, step, onMsg) {
+  if (window.__mtStub) return await window.__mtStub(texts, step.model, onMsg);
+  let w;
+  try { w = createMtWorker(); }
+  catch (err) {
+    throw subUserErr('翻译器启动失败：这个浏览器可能不支持 Worker（' + String((err && err.message) || err) + '）');
+  }
+  mtWorker = w;
+  let readyResolve, readyReject, doneResolve, doneReject;
+  const ready = new Promise((res, rej) => { readyResolve = res; readyReject = rej; });
+  const done = new Promise((res, rej) => { doneResolve = res; doneReject = rej; });
+  ready.catch(() => {}); done.catch(() => {});
+  mtWorkerCancel = () => {
+    const e = new Error('已取消'); e.__asrCancelled = true;
+    readyReject(e); doneReject(e);
+  };
+  w.onmessage = (ev) => {
+    const d = ev.data;
+    onMsg(d);
+    if (d.type === 'ready') readyResolve();
+    else if (d.type === 'done') doneResolve(d.texts || []);
+    else if (d.type === 'err') { const e = new Error(d.text); readyReject(e); doneReject(e); }
+  };
+  w.onerror = (ev) => {
+    const e = new Error((ev && ev.message) || '翻译器出错');
+    readyReject(e); doneReject(e);
+  };
+  try {
+    w.postMessage({ type: 'load', model: step.model, dtype: step.dtype });
+    await ready;
+    w.postMessage({ type: 'texts', texts });
+    return await done;
+  } finally {
+    if (mtWorker === w) { mtWorker = null; mtWorkerCancel = null; }
+    try { w.terminate(); } catch (e) {}
+  }
+}
+
+// 按语言选择模型链：英语 = en→zh；阿拉伯语 = ar→en→zh（两段串行，每段跑完即释放）
+async function translateTexts(texts, job) {
+  const chain = SUB_ZH_MODELS[SUB_LANG] || SUB_ZH_MODELS.en;
+  let work = texts.slice();
+  for (let s = 0; s < chain.length; s++) {
+    const step = chain[s];
+    sub.trStep = s + 1; sub.trStepN = chain.length;
+    sub.trReady = false; sub.trDone = 0; sub.trTotal = work.length;
+    sub.dlLoaded = 0; sub.dlTotal = 0; sub.dlPct = 0;
+    sub.lastAt = Date.now();
+    renderSubPanel();
+    work = await runMtModel(work, step, (d) => {
+      if (job !== subJob) return;
+      sub.lastAt = Date.now();
+      if (d.type === 'download') {
+        sub.dlLoaded = d.loaded; sub.dlTotal = d.total;
+        sub.dlPct = d.total ? d.loaded / d.total : 0;
+        renderSubPanel();
+      } else if (d.type === 'ready') {
+        sub.trReady = true; renderSubPanel();
+      } else if (d.type === 'progress') {
+        sub.trDone = d.i; sub.trTotal = d.n; renderSubPanel();
+      }
+    });
+    if (job !== subJob) { const e = new Error('已取消'); e.__asrCancelled = true; throw e; }
+    work = (work || []).map(x => (x || '').trim());
+  }
+  return work;
+}
+
+// 给已有字幕补中文：失败只记 warning，不推翻已经生成的原文字幕
+async function subTranslateRec(rec, job) {
+  subRunClear();     // 转写已落盘；翻译阶段就算崩溃，也不该被当成 ASR 崩溃
+  sub.state = 'running';
+  sub.phase = 'translate';
+  sub.trStep = 1; sub.trStepN = (SUB_ZH_MODELS[SUB_LANG] || []).length;
+  sub.trReady = false; sub.trDone = 0; sub.trTotal = rec.chunks.length;
+  sub.dlLoaded = 0; sub.dlTotal = 0; sub.dlPct = 0; sub.lastAt = Date.now();
+  renderSubPanel();
+  try {
+    const out = await translateTexts(rec.chunks.map(c => c.text), job);
+    if (job !== subJob) return;
+    rec.chunks.forEach((c, i) => { if (out[i]) c.zh = out[i]; });
+    rec.zhAt = Date.now();
+    rec.zhModel = (SUB_ZH_MODELS[SUB_LANG] || []).map(x => x.model).join(' > ');
+    sub.rec = rec;
+    try { await subPut(rec); } catch (e) { if (job === subJob) sub.warn = SUB_SAVE_WARN; }
+  } catch (e) {
+    if (job !== subJob) return;
+    if (!(e && e.__asrCancelled)) sub.warn = '中文翻译失败：' + String((e && e.message) || e);
+  } finally {
+    if (job === subJob) sub.state = 'done';
+  }
 }
 
 async function startAsrJob({ audio, model, lang, onMsg, workerType = 'module', startSeg = 0 }) {
@@ -1118,6 +1287,17 @@ function syncSubModelOptions() {
   for (const option of sel.options) if (text[option.value]) option.textContent = text[option.value];
   sel.value = subModel;
   A('subLang').value = SUB_LANG;
+  syncZhUI();
+}
+
+// 中文翻译开关与体积说明（阿拉伯语要过两个模型，体积随之变化）
+function syncZhUI() {
+  const chain = SUB_ZH_MODELS[SUB_LANG] || [];
+  const mb = chain.reduce((s, x) => s + x.mb, 0);
+  A('subZhNote').textContent = chain.length > 1
+    ? '（本地模型，首次约 ' + mb + 'MB，经英文中转）'
+    : '（本地模型，首次约 ' + mb + 'MB）';
+  A('subZh').checked = subZhOn;
 }
 
 function applySubModelLimits() {
@@ -1383,11 +1563,15 @@ async function subStartStreaming(t, key, job) {
   const rec = { key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
                 durationSec: sub.totalSec, chunks: chunksOut, doneSeg: sub.segTotal,
                 segSec: SUB_SEG_SEC, partial: false };
-  sub.rec = rec; sub.state = rec.chunks.length ? 'done' : 'error';
-  if (!rec.chunks.length) sub.err = '这段音频没识别出任何句子';
-  else {
+  sub.rec = rec;
+  if (!rec.chunks.length) {
+    sub.state = 'error';
+    sub.err = '这段音频没识别出任何句子';
+  } else {
+    sub.state = 'done';
     try { await subPut(rec); }
     catch (e) { if (job === subJob) sub.warn = SUB_SAVE_WARN; }
+    if (subZhOn) await subTranslateRec(rec, job);
   }
 }
 
@@ -1410,6 +1594,7 @@ async function subStart() {
   sub.state = 'running'; sub.err = ''; sub.warn = ''; sub.t0 = Date.now();
   sub.phase = 'decode'; sub.dlPct = 0; sub.dlLoaded = 0; sub.dlTotal = 0; sub.device = '';
   sub.booted = false; sub.lastAt = Date.now(); sub.crash = ''; sub.segDone = 0; sub.segTotal = 0;
+  sub.trReady = false; sub.trDone = 0; sub.trTotal = 0; sub.trStep = 0; sub.trStepN = 0;
   subWakeOn();
   sub.totalSec = (audio.duration || 0) || 0;
   renderSubPanel();
@@ -1512,15 +1697,22 @@ async function subStart() {
     const rec = { key, model: SUB_MODELS[subModel].id, lang: SUB_LANG, createdAt: Date.now(),
                   durationSec: sub.totalSec, chunks: chunksOut,
                   doneSeg: sub.segTotal, segSec: SUB_SEG_SEC, partial: false };
-    sub.rec = rec; sub.state = rec.chunks.length ? 'done' : 'error';
-    if (!rec.chunks.length) sub.err = '这段音频没识别出任何句子';
-    else {
+    sub.rec = rec;
+    if (!rec.chunks.length) {
+      sub.state = 'error';
+      sub.err = '这段音频没识别出任何句子';
+    } else {
+      sub.state = 'done';
       try { await subPut(rec); }
       catch (e) {
         // 落库失败（QuotaExceededError 等）不能报成功：文稿只在内存里，重开页面就没了。
         // 状态仍是 done（文稿确实生成了，导出、跟读都能用），只是状态行如实带一句警告。
         if (job !== subJob) return;
         sub.warn = SUB_SAVE_WARN;
+      }
+      if (subZhOn) {
+        await subTranslateRec(rec, job);
+        if (job !== subJob) return;
       }
     }
   } catch (e) {
@@ -1558,12 +1750,36 @@ async function subStart() {
 function subStop() { subJob++; cancelAsrJob(); subClearTimer(); subWakeOff(); subRunClear(); sub.state = sub.rec ? 'done' : 'ready'; renderSubPanel(); }
 function subClearTimer() { if (subTimer) { clearInterval(subTimer); subTimer = null; } }
 
+// 「翻译中文」按钮：只翻译已生成的字幕，不重跑识别
+async function subTranslateExisting() {
+  const rec = sub.rec;
+  if (!rec || !rec.chunks || !rec.chunks.length || sub.state === 'running') return;
+  const job = ++subJob;
+  subClearTimer();
+  cancelAsrJob();
+  sub.err = ''; sub.warn = ''; sub.t0 = Date.now(); sub.lastAt = Date.now();
+  subWakeOn();
+  renderSubPanel();
+  subTimer = setInterval(() => { if (sub.state === 'running') renderSubPanel(); }, 1000);
+  await subTranslateRec(rec, job);
+  if (job !== subJob) return;
+  subClearTimer();
+  subRunClear();
+  renderSubPanel(); renderSubList();
+  subSyncLine(audio.currentTime * 1000, true);
+  subWakeOff();
+}
+
 /* ============ 字幕：同步 ============ */
 let subIdx = -1;
 function subSyncLine(ms, force) {
   const cs = sub.rec && sub.rec.chunks;
   if (!cs) {
-    if (subIdx !== -1 || force) { subIdx = -1; subLineEl.textContent = ''; subLineEl.classList.remove('on'); }
+    if (subIdx !== -1 || force) {
+      subIdx = -1;
+      subOrigEl.textContent = ''; subZhLineEl.textContent = '';
+      subLineEl.classList.remove('on');
+    }
     return;
   }
   const t = ms / 1000;
@@ -1579,7 +1795,10 @@ function subSyncLine(ms, force) {
   if (i === subIdx && !force) return;
   subIdx = i;
   const c = cs[i];
-  subLineEl.textContent = c ? c.text : '';
+  const zh = (c && subZhOn && c.zh) ? c.zh : '';
+  subOrigEl.textContent = c ? c.text : '';
+  subZhLineEl.textContent = zh;
+  subZhLineEl.hidden = !zh;
   subLineEl.classList.toggle('on', !!c);
   const rows = subListEl.children;
   for (let k = 0; k < rows.length; k++) rows[k].classList.toggle('on', k === i);
@@ -1587,7 +1806,8 @@ function subSyncLine(ms, force) {
 }
 
 /* ============ 字幕：面板 ============ */
-const subPanel = A('subPanel'), subListEl = A('subList'), subLineEl = A('subline');
+const subPanel = A('subPanel'), subListEl = A('subList'), subLineEl = A('subline'),
+      subOrigEl = A('subOrig'), subZhLineEl = A('subZhLine');
 function showPanel(name) {
   panel.hidden = name !== 'sens';
   ratePanel.hidden = name !== 'rate';
@@ -1597,11 +1817,17 @@ function showPanel(name) {
 function renderSubPanel() {
   const st = A('subStatus'), start = A('subStart'), stop = A('subStop'), del = A('subDel');
   const running = sub.state === 'running';
+  const hasZh = !!(sub.rec && sub.rec.chunks && sub.rec.chunks.some(c => c.zh));
   start.hidden = running || sub.state === 'done' || !tracks[cur];
   stop.hidden = !running;
   del.hidden = !sub.rec || running;
+  A('subZh').checked = subZhOn;
+  // 已有原文但还没有中文、且勾选了中文翻译时，给一个补翻译入口
+  A('subTransZh').hidden = !(subZhOn && sub.rec && sub.rec.chunks && sub.rec.chunks.length
+                             && !hasZh && !running && tracks[cur]);
   A('subModelRow').hidden = !!sub.rec;
   A('subExportRow').hidden = sub.state !== 'done';
+  A('subSrtZh').hidden = A('subTxtZh').hidden = !(subZhOn && hasZh && sub.state === 'done');
   A('subModel').value = subModel;
   A('subLang').value = SUB_LANG;
   start.textContent = sub.state === 'error' ? '重新生成' : '生成字幕';
@@ -1617,7 +1843,19 @@ function renderSubPanel() {
   else if (sub.state === 'running') {
     // 三个阶段都带上"已用时长"：实时可见，用户就不必猜它是不是卡住了
     const el = fmtElapsed((Date.now() - sub.t0) / 1000);
-    if (sub.phase === 'transcribe') {
+    if (sub.phase === 'translate') {
+      const stepTxt = sub.trStepN > 1 ? '（模型 ' + sub.trStep + '/' + sub.trStepN + '）' : '';
+      if (!sub.trReady) {
+        const mb = (sub.dlLoaded / 1048576).toFixed(1)
+          + (sub.dlTotal ? ' / ' + (sub.dlTotal / 1048576).toFixed(1) : '') + 'MB';
+        st.textContent = '正在准备翻译模型…' + (sub.dlTotal ? Math.round(sub.dlPct * 100) + '%，' : '')
+          + '已下载 ' + mb + '（已用 ' + el + '，首次可能要几分钟）' + stepTxt
+          + (Date.now() - sub.lastAt > 30000 ? '——已 30 秒无下载进展，可点「停止」后重试' : '');
+      } else {
+        st.textContent = '翻译中…（已译 ' + sub.trDone + '/' + sub.trTotal + ' 句，已用 ' + el + '）' + stepTxt
+          + (Date.now() - sub.lastAt > 60000 ? '——已 60 秒没有进展，可点「停止」后重试' : '');
+      }
+    } else if (sub.phase === 'transcribe') {
       const segTxt = sub.segTotal > 1 ? '已转写 ' + sub.segDone + '/' + sub.segTotal + ' 段，' : '';
       st.textContent = '转写中…（' + segTxt + '已用 ' + el + '，音频 ' + Math.round(sub.totalSec) + 's'
         + (sub.device ? '，' + sub.device : '') + '，请保持屏幕常亮）'
@@ -1647,7 +1885,8 @@ function renderSubPanel() {
     }
   }
   else if (sub.state === 'done') st.textContent = '字幕已生成（' + SUB_LANG_NAME[SUB_LANG] + ' · '
-      + sub.rec.chunks.length + ' 句' + (sub.device ? ' · ' + sub.device : '') + '）'
+      + sub.rec.chunks.length + ' 句' + (sub.device ? ' · ' + sub.device : '')
+      + (hasZh ? ' · 含中文翻译' : '') + '）'
       + (sub.warn ? '，但' + sub.warn : '');
   else st.textContent = sub.err || '失败';
   // 「上次生成在哪一步中断」的提示：挂在任何状态后面显示，直到用户再点一次生成
@@ -1664,8 +1903,13 @@ function renderSubList() {
   if (!sub.rec) return;
   sub.rec.chunks.forEach((c, i) => {
     const d = document.createElement('div');
-    d.className = 'row'; d.dataset.i = i; d.textContent = c.text;
-    d.dir = 'auto';   // 阿拉伯语等 RTL 文本按内容方向排版
+    d.className = 'row'; d.dataset.i = i; d.dir = 'auto';   // RTL 文本按内容方向排版
+    const o = document.createElement('div'); o.className = 'orig'; o.dir = 'auto'; o.textContent = c.text;
+    d.appendChild(o);
+    if (subZhOn && c.zh) {
+      const z = document.createElement('div'); z.className = 'trans'; z.dir = 'auto'; z.textContent = c.zh;
+      d.appendChild(z);
+    }
     d.addEventListener('click', () => { audio.currentTime = c.s; paint(); });
     subListEl.appendChild(d);
   });
@@ -1677,7 +1921,9 @@ function subOnTrackChanged() {
   subWakeOff();      // 同理：换歌会让 subStart 提前 return 跳过尾部 subWakeOff()，这里收掉转写期间的唤醒锁
   subRunClear();     // 换歌是主动取消，不是崩溃，别把留痕留给下次启动
   sub.state = 'none'; sub.rec = null; sub.err = ''; sub.dlPct = 0; sub.warn = '';
-  subLineEl.textContent = ''; subLineEl.classList.remove('on');
+  sub.trReady = false; sub.trDone = 0; sub.trTotal = 0; sub.trStep = 0; sub.trStepN = 0;
+  subOrigEl.textContent = ''; subZhLineEl.textContent = '';
+  subLineEl.classList.remove('on');
   renderSubList(); renderSubPanel();
   const k = curKey(); if (!k) return;
   subGet(subKey(k)).then(r => {
@@ -1707,6 +1953,14 @@ A('subDel').addEventListener('click', async () => {
   const k = curKey(); if (k) await subDelete(subKey(k));
   sub.rec = null; sub.state = 'ready'; renderSubList(); renderSubPanel(); subSyncLine(0, true);
 });
+// 中文翻译开关（只影响生成/显示；已有原文可点「翻译中文」补译）
+A('subZh').addEventListener('change', () => {
+  subZhOn = !!A('subZh').checked;
+  LS.set('subZh', subZhOn);
+  renderSubPanel(); renderSubList();
+  subSyncLine(audio.currentTime * 1000, true);
+});
+A('subTransZh').addEventListener('click', subTranslateExisting);
 A('subModel').addEventListener('change', () => {
   subModel = isBareWebKit() && A('subModel').value === 'small' ? 'base' : A('subModel').value;
   A('subModel').value = subModel;
@@ -1731,20 +1985,26 @@ function srtTime(sec) {
   return p(Math.floor(ms / 3600000)) + ':' + p(Math.floor(ms / 60000) % 60) + ':'
        + p(Math.floor(ms / 1000) % 60) + ',' + p(ms % 1000, 3);
 }
-function subExport(fmt) {
+function subExport(fmt, zhOnly) {
   if (!sub.rec) return;
   const name = (tracks[cur] && tracks[cur].name || 'subtitle').replace(/\.[^.]+$/, '');
+  const chunks = zhOnly ? sub.rec.chunks.filter(c => subZhOn && c.zh) : sub.rec.chunks;
+  if (!chunks.length) return;
+  // 勾选中文翻译时，原文文件带中英双语；「中文 .srt / .txt」只导出中文
+  const line = c => zhOnly ? c.zh : (subZhOn && c.zh ? c.text + '\n' + c.zh : c.text);
   const body = fmt === 'srt'
-    ? sub.rec.chunks.map((c, i) => (i + 1) + '\n' + srtTime(c.s) + ' --> ' + srtTime(c.e) + '\n' + c.text).join('\n\n') + '\n'
-    : sub.rec.chunks.map(c => c.text).join('\n') + '\n';
+    ? chunks.map((c, i) => (i + 1) + '\n' + srtTime(c.s) + ' --> ' + srtTime(c.e) + '\n' + line(c)).join('\n\n') + '\n'
+    : chunks.map(line).join('\n') + '\n';
   const url = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }));
   const a = document.createElement('a');
-  a.href = url; a.download = name + '.' + fmt;
+  a.href = url; a.download = name + (zhOnly ? '.zh.' : '.') + fmt;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
-A('subSrt').addEventListener('click', () => subExport('srt'));
-A('subTxt').addEventListener('click', () => subExport('txt'));
+A('subSrt').addEventListener('click', () => subExport('srt', false));
+A('subTxt').addEventListener('click', () => subExport('txt', false));
+A('subSrtZh').addEventListener('click', () => subExport('srt', true));
+A('subTxtZh').addEventListener('click', () => subExport('txt', true));
 
 /* ============ 启动 ============ */
 var jsOk = document.getElementById('jsok');
