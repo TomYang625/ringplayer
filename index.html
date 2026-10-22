@@ -523,11 +523,58 @@ function setPlaying(playing) {
 }
 function revoke(t) { if (t && t.url) { URL.revokeObjectURL(t.url); t.url = null; } }
 
+// iOS「文件」/iCloud 选出来的 File 常常没有可用的 MIME（type 为空或不是 audio/*），
+// 直接给媒体元素会报“格式不支持”。按扩展名补一个，并生成播放用的 Blob URL。
+const AUDIO_MIME_BY_EXT = { mp3: 'audio/mpeg', m4a: 'audio/mp4', mp4: 'audio/mp4', aac: 'audio/aac',
+  wav: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg', flac: 'audio/flac', webm: 'audio/webm' };
+const AUDIO_MIME_ALIAS = { 'audio/mp3': 'audio/mpeg', 'audio/x-mpeg': 'audio/mpeg', 'audio/x-mp3': 'audio/mpeg',
+  'audio/x-wav': 'audio/wav', 'audio/wave': 'audio/wav', 'audio/x-m4a': 'audio/mp4', 'audio/m4a': 'audio/mp4' };
+function audioMimeFor(name, type) {
+  const ext = (String(name || '').match(/\.([^.]+)$/) || [])[1];
+  const byExt = ext ? AUDIO_MIME_BY_EXT[ext.toLowerCase()] : '';
+  const t = String(type || '').toLowerCase();
+  if (t && (t.startsWith('audio/') || t === 'application/ogg')) return AUDIO_MIME_ALIAS[t] || t;
+  return byExt || t || 'audio/mpeg';
+}
+function normalizedBlob(name, blob) {
+  const type = audioMimeFor(name, blob.type);
+  return blob.type === type ? blob : blob.slice(0, blob.size, type);
+}
+function trackUrl(t) {
+  if (!t.url) t.url = URL.createObjectURL(normalizedBlob(t.name, t.blob));
+  return t.url;
+}
+function mediaErrText(err) {
+  const c = err && err.code;
+  return ({ 1: '播放被中止', 2: '网络错误', 3: '解码失败', 4: '格式不受支持或文件已损坏' }[c] || '未知错误');
+}
+
+// 等主播放器拿到时长；iPhone 上刚选完文件就点生成字幕时，duration 往往还是 0
+async function ensureAudioMeta(ms) {
+  if (isFinite(audio.duration) && audio.duration > 0) return true;
+  if (audio.error) return false;
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return; done = true;
+      audio.removeEventListener('loadedmetadata', finish);
+      audio.removeEventListener('durationchange', finish);
+      audio.removeEventListener('error', finish);
+      resolve();
+    };
+    audio.addEventListener('loadedmetadata', finish);
+    audio.addEventListener('durationchange', finish);
+    audio.addEventListener('error', finish);
+    try { if (audio.readyState === 0 && audio.src) audio.load(); } catch (e) {}
+    setTimeout(finish, ms || 8000);
+  });
+  return isFinite(audio.duration) && audio.duration > 0;
+}
+
 function playCurrent() {
   const t = tracks[cur];
   if (!t) return;
-  if (!t.url) t.url = URL.createObjectURL(t.blob);
-  audio.src = t.url;
+  audio.src = trackUrl(t);
   duration = 0;
   audio.loop = !loopActive();         // 默认整曲循环；A-B 生效时交给 loopTick 跳回 A
   audio.defaultPlaybackRate = rate;   // 换 src 会重置倍速为 1，这里重新应用
@@ -545,7 +592,32 @@ function playCurrent() {
     updateLoopUI();     // 时长到了，区间条/把手才可以显示和拖动
     renderSubPanel();   // 元数据到了，刷新面板（"这段约需多久"要靠时长才算得出来）
   };
-  audio.onerror = () => setErr('无法播放该文件');
+  audio.onerror = () => {
+    // 有些 iOS「文件」来源的 File 不能直接给媒体元素用：读成普通 Blob 再试一次
+    if (!t.repaired) {
+      t.repaired = true;
+      (async () => {
+        try {
+          const buf = await t.blob.arrayBuffer();
+          if (tracks[cur] !== t) return;    // 这期间已经切歌
+          if (!buf.byteLength) {
+            setErr('读到的文件是空的（0 字节）：若这首歌在 iCloud 或「文件」里还没下载到本机，请先在「文件」App 里下载再试');
+            return;
+          }
+          t.blob = new Blob([buf], { type: audioMimeFor(t.name, t.blob.type) });
+          revoke(t); t.url = null;
+          if (db && t.key) dbPut({ key: t.key, name: t.name, blob: t.blob }).catch(() => {});
+          audio.src = trackUrl(t);
+          const pr = audio.play(); if (pr && pr.catch) pr.catch(() => {});
+        } catch (e) {
+          if (tracks[cur] !== t) return;
+          setErr('读不出这个文件的内容：' + String((e && e.message) || e));
+        }
+      })();
+      return;
+    }
+    setErr('无法播放该文件（' + mediaErrText(audio.error) + '）。若是从 iCloud/「文件」选的文件，请先确认它已下载到本机，并确认扩展名和实际格式一致');
+  };
   audio.ontimeupdate = () => {
     if (!dragging) {
       loopTick();     // 后台标签页里 RAF 会被节流，这里兜底
@@ -826,7 +898,7 @@ const SUB_TOO_LONG_ERR = '音频太长了：这台设备一次最多转写 ' + S
   + '（更长的文件光解码就要占掉大量内存，iPad 上可能崩溃），先裁短再试';
 // 本机实测倍速（音频秒数 ÷ 转写秒数），按模型档分别记。第一次跑完后就有了，用来预估"这段要等多久"。
 const SUB_LS_SPEED = 'subSpeed';
-const SUB_DECODE_ERR = '这个文件浏览器解不开（格式不支持或文件已损坏），换一首再试';
+const SUB_DECODE_ERR = '这个文件浏览器解不开（格式不受支持、文件损坏，或还没从 iCloud 下载到本机），换一首或先下载再试';
 const SUB_SAVE_WARN = '没能保存（存储空间可能不足）';
 // 带 __userFacing 的错：文案已经是可以直接给用户看的，不再走 subStart 里那套错误映射
 function subUserErr(msg) { const e = new Error(msg); e.__userFacing = true; return e; }
@@ -1505,7 +1577,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function subStartStreaming(t, key, job) {
-  if (!isFinite(sub.totalSec) || sub.totalSec <= 0) throw subUserErr(SUB_DECODE_ERR);
+  if (!isFinite(sub.totalSec) || sub.totalSec <= 0) throw subUserErr('音频时长还没读出来，请先点一下播放、等进度条出现后再生成字幕');
   if (sub.totalSec > SUB_MAX_SEC) throw subUserErr(SUB_TOO_LONG_ERR);
   let chunks = [], doneSeg = 0, gotSeg = false;
   const prev = await subGet(key);
@@ -1521,7 +1593,7 @@ async function subStartStreaming(t, key, job) {
   subRunMark('prep');
   renderSubPanel();
   await startAsrStreamJob({
-    blob: t.blob,
+    blob: normalizedBlob(t.name, t.blob),
     model: SUB_MODELS[subModel].id,
     dtype: SUB_MODELS[subModel].dtype,
     lang: SUB_LANG,
@@ -1596,11 +1668,23 @@ async function subStart() {
   sub.booted = false; sub.lastAt = Date.now(); sub.crash = ''; sub.segDone = 0; sub.segTotal = 0;
   sub.trReady = false; sub.trDone = 0; sub.trTotal = 0; sub.trStep = 0; sub.trStepN = 0;
   subWakeOn();
-  sub.totalSec = (audio.duration || 0) || 0;
-  renderSubPanel();
   subTimer = setInterval(() => { if (sub.state === 'running') renderSubPanel(); }, 1000);
+  renderSubPanel();
   try {
-    if (!t.url) t.url = URL.createObjectURL(t.blob);
+    // iPhone 上刚选完文件就点生成字幕时，主播放器往往还没读到时长（audio.duration=0）。
+    // 先等元数据，别把"还没加载好"误报成"格式不支持"。
+    const okMeta = await ensureAudioMeta(8000);
+    if (job !== subJob) return;
+    if (!okMeta) {
+      if (audio.error) {
+        throw subUserErr('这个文件浏览器解不开（' + mediaErrText(audio.error)
+          + '）：若文件在 iCloud/「文件」里还没下载到本机，请先下载再试');
+      }
+      throw subUserErr('音频还没加载好，暂时读不出时长。请先点一下播放，等进度条出现后再生成字幕');
+    }
+    sub.totalSec = audio.duration;
+    if (!t.url) t.url = trackUrl(t);
+    renderSubPanel();
     if (isBareWebKit()) {
       await subStartStreaming(t, key, job);
       if (job !== subJob) return;
